@@ -1,0 +1,219 @@
+{
+  "company_info": [
+    { "name": "LeadBaseAI — AI Employee Agency" },
+    { "founder": "Aakash Kumar Mishra" },
+    { "mission": "To deploy custom AI agents for your business that work 24/7 in a scalable, affordable way — so you never miss a lead or a customer again." },
+    { "vision": "To become the go-to AI automation partner for small and medium businesses in India — making enterprise-grade AI accessible without the enterprise price tag." },
+    { "usp": "We build fully custom AI agents hosted on our own local servers — so your data never leaves a secure environment. We also operate without the standard Meta WhatsApp API, using our own Meta integration, which means faster setup, lower costs, and no third-party data exposure." },
+    { "target_customers": "Small to medium-sized service-based business owners and solo ecom store owners who manage lead inquiries on WhatsApp. Particularly suited for businesses running Facebook or Instagram ads where leads land on WhatsApp for their first inquiry — and need someone to handle, qualify, and convert those leads automatically." },
+    { "history": "LeadBaseAI was founded a few months ago by Aakash Kumar Mishra. The team started by contributing to open-source AI projects before channeling that expertise into building practical, affordable automation solutions for Indian businesses." },
+    { "established": "2025" },
+    { "location": "Delhi, India" }
+  ],
+
+  "products": [
+    {
+      "product_id": "prod_001",
+      "name": "WhatsApp Sales AI Agent",
+      "tagline": "Handles your inbound leads on WhatsApp — qualifies them and books appointments, automatically.",
+      "description": "An intelligent AI agent that sits on your WhatsApp and handles every inbound lead from the moment they say Hi. It understands their need, qualifies them based on your criteria, answers their questions, and when the time is right — books a discovery or sales call on your calendar. No manual follow-up. No missed leads.",
+      "best_for": "Businesses running Facebook or Instagram ads whose leads land on WhatsApp. Coaches, consultants, agencies, service providers who want to automate the top of their sales funnel.",
+      "key_features": [
+        "24/7 inbound lead handling on WhatsApp",
+        "Automatic lead qualification and filtering",
+        "Appointment booking with calendar integration",
+        "Custom persona and tone matching your brand",
+        "Human handoff when a lead needs personal attention"
+      ],
+      "not_included": [
+        "Outbound lead generation or cold messaging",
+        "CRM integrations",
+        "Multi-language support (English only)"
+      ],
+      "pricing": [
+        {
+          "plan": "Starter",
+          "duration": "1 month",
+          "price_inr": "₹1,500",
+          "limit": "200 total AI messages",
+          "best_for": "Businesses testing the waters or with low daily inquiry volume"
+        },
+        {
+          "plan": "Growth",
+          "duration": "3 months",
+          "price_inr": "₹3,000",
+          "limit": "2,000 AI messages",
+          "best_for": "Small businesses with steady but moderate daily lead flow"
+        },
+        {
+          "plan": "Pro",
+          "duration": "3 months",
+          "price_inr": "₹7,000",
+          "limit": "10,000 AI messages",
+          "best_for": "Businesses running active ad campaigns with high lead volume"
+        },
+        {
+          "plan": "Scale",
+          "duration": "3 months",
+          "price_inr": "₹25,000",
+          "limit": "Unlimited AI messages",
+          "best_for": "High-volume businesses who want set-and-forget automation for 6 months"
+        }
+      ],
+      "limitations": [
+        "AI message limits are counted per reply sent by the agent, not per conversation",
+        "Agent response speed is intentionally moderate to avoid WhatsApp automated-message flags",
+        "Clients with very high traffic spikes may risk WhatsApp account flagging — LeadBaseAI is not responsible for third-party platform actions",
+        "Outbound messaging / cold outreach is not supported"
+      ],
+      "setup_time": "Typically less than a day after onboarding call and information submission"
+    },
+    {
+      "product_id": "prod_002",
+      "name": "WhatsApp Customer Support Agent",
+      "tagline": "Handles customer queries, product questions, and support tickets on WhatsApp — 24/7.",
+      "description": "An AI support agent designed for ecommerce and product-based businesses. It handles inbound customer questions about orders, products, reviews, and general queries — giving customers instant accurate replies without a human support team needed for every message.",
+      "best_for": "Ecommerce store owners who receive high volumes of repetitive customer questions on WhatsApp — about products, delivery, returns, order status, and reviews.",
+      "key_features": [
+        "Handles unlimited messages per customer within the plan's customer cap",
+        "Answers product and service FAQs accurately",
+        "Handles order-related queries when integrated with your store data",
+        "Escalates complex issues to human support automatically",
+        "Custom trained on your product catalogue and policies"
+      ],
+      "not_included": [
+        "Outbound marketing or promotional messages",
+        "CRM or order management system integration",
+        "Voice or call support"
+      ],
+      "pricing": [
+        {
+          "plan": "Basic",
+          "price_inr": "₹1,500",
+          "limit": "100 unique customers handled, unlimited messages per customer",
+          "best_for": "Small ecom stores just getting started with automation"
+        },
+        {
+          "plan": "Standard",
+          "price_inr": "₹4,000",
+          "limit": "300 unique customers handled, unlimited messages per customer",
+          "best_for": "Growing ecom stores with moderate support volume"
+        },
+        {
+          "plan": "Business",
+          "price_inr": "₹10,000",
+          "limit": "1,000 unique customers handled, unlimited messages per customer",
+          "best_for": "High-volume ecom businesses needing full-scale support automation"
+        }
+      ],
+      "limitations": [
+        "Customer count is per unique WhatsApp number per billing period",
+        "Requires product and policy information to be submitted during onboarding",
+        "Agent response speed is intentionally moderate to avoid WhatsApp automated-message flags",
+        "Account flagging due to high traffic spikes is the client's responsibility"
+      ],
+      "setup_time": "Typically less than a day  after onboarding call and information submission"
+    }
+  ],
+
+  "faqs": [
+    {
+      "question": "Do you use the official Meta WhatsApp Business API?",
+      "answer": "No — and that's actually an advantage. We use our own Meta integration, which means faster setup, lower costs for you, and your data doesn't pass through third-party API providers."
+    },
+    {
+      "question": "Is my customer chat data stored or used to train your models?",
+      "answer": "No. We do not store your customer conversations or use them to train our models. We only log the count of AI messages used for billing purposes. Your data stays private."
+    },
+    {
+      "question": "Why does the AI reply a little slowly sometimes?",
+      "answer": "This is intentional. We add a slight delay to responses to make them feel natural and to prevent WhatsApp from flagging your number as sending automated messages."
+    },
+    {
+      "question": "Can I use my own AI model or API key?",
+      "answer": "Yes. If you prefer faster response times and want to use your own API key (e.g. OpenAI or Anthropic), we can configure the agent to use it. This gives you more control over speed and cost."
+    },
+    {
+      "question": "Can I cancel my subscription midway?",
+      "answer": "No. Subscriptions cannot be cancelled mid-period. If you cancel before the period ends, no refund is issued. The only exception is if a failure on our end occurs — in that case we refund the remaining period."
+    },
+    {
+      "question": "What happens if I run out of AI messages?",
+      "answer": "The agent will stop responding until you upgrade your plan or your billing period resets. We recommend monitoring usage — we can also notify you when you're approaching your limit."
+    },
+    {
+      "question": "Can the agent handle Hindi or regional languages?",
+      "answer": "The agent is trained primarily in English and Hindi. It can respond in Hinglish naturally. For other regional languages, please speak to our team."
+    },
+    {
+      "question": "How long does setup take?",
+      "answer": "Typically less than a day after your onboarding call and after you've submitted your business information to us."
+    },
+    {
+      "question": "What if the AI says something wrong to my customer?",
+      "answer": "The agent is trained strictly on information you provide us. It is instructed never to guess or invent answers. If it doesn't know something, it escalates to a human. You are responsible for the accuracy of the information you give us during onboarding."
+    },
+    {
+      "question": "Do you offer outbound messaging or cold outreach?",
+      "answer": "No. Both our products handle inbound conversations only. We do not support outbound lead generation or cold messaging."
+    }
+  ],
+
+  "business_policies": [
+    "If a failure occurs on LeadBaseAI's end during an active subscription period — such as the agent going down or a critical bug — we will refund the proportional amount for the affected days. Refunds are not issued for any other reason.",
+    "Subscriptions cannot be cancelled mid-period. If a client chooses to stop using the service before the period ends, no refund is given. The subscription simply expires at the end of the billing period.",
+    "Data Privacy: LeadBaseAI does not store or retain your customers' personal conversations. We only log AI message usage counts for billing verification. Your data is never used to train our models or shared with third parties.",
+    "Intentional Response Delay: Our agents are configured to reply with a slight delay. This is intentional — it prevents WhatsApp from flagging your number for automated messaging behaviour and makes the agent feel more human.",
+    "WhatsApp Account Flagging: If your account experiences very high message volumes in short periods, WhatsApp may flag or restrict your number. LeadBaseAI is not responsible for any third-party platform actions, including WhatsApp bans or restrictions.",
+    "Abuse and Fair Use: If we detect abuse of message limits, model manipulation, or misuse of the platform, LeadBaseAI reserves the right to cancel the subscription with one prior notice. Repeat or severe abuse may result in immediate termination without notice. No refund is issued in abuse cases.",
+    "No Data Retention for Model Training: We do not retain or use any client or customer data to train, fine-tune, or improve our AI models. All models are built and trained independently of client deployments.",
+    "If we detect abuse of message limits, model manipulation, or misuse of the platform, LeadBaseAI reserves the right to cancel the subscription with one prior notice. Repeat or severe abuse may result in immediate termination without notice. No refund is issued in abuse cases."
+  ],
+
+  "links": {      
+        "website":"not available",
+        "brochure":"not available",
+        "instagram":"https://instagram.com/leadbaseai",
+        "linkedin":"not available",
+        "youtube":"not available"
+    }
+,
+
+  "testimonials": ["not available"],
+
+  "onboarding_process": [
+    {
+      "step": 1,
+      "title": "Book a Discovery Call",
+      "detail": "Chat with Varun on WhatsApp to understand your needs. We figure out which product fits, what your lead or support volume looks like, and what the agent needs to know."
+    },
+    {
+      "step": 2,
+      "title": "Submit Your Business Information",
+      "detail": "You fill out a short form or send us a document covering your services, FAQs, pricing, and tone. This is what we use to train the agent on your business."
+    },
+    {
+      "step": 3,
+      "title": "Agent Setup and Testing",
+      "detail": "We build and configure your custom agent over 3–5 business days. You get a test environment first to try it yourself and suggest changes before going live."
+    },
+    {
+      "step": 4,
+      "title": "Go Live",
+      "detail": "Once approved, we connect the agent to your WhatsApp number and it starts handling conversations. We monitor the first few days and fix any issues quickly."
+    }
+  ],
+
+  "team": [
+    {
+      "name": "Aakash Kumar Mishra",
+      "role": "Founder & AI Engineer",
+      "bio": "Aakash founded LeadBaseAI after working on open-source AI projects. He builds and maintains the core agent infrastructure and model deployments."
+    },
+    {
+      "name": "Varun",
+      "role": "Sales and Customer Dealing Agent",
+      "bio": "Varun handles all client-facing conversations — answering questions about our services, qualifying leads, and guiding prospects through to booking a discovery call."
+    }
+  ]
+}
