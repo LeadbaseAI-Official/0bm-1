@@ -6,16 +6,16 @@ import re
 import subprocess
 import uvicorn
 import threading
+import requests
 from typing import Optional
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from github import Github, Auth
 from github.GithubException import UnknownObjectException
+from contextlib import asynccontextmanager
 
 from model import run_model_query, MODEL_CODE
-
-app: FastAPI = FastAPI(title="Local GGUF LLM API Server")
 
 class ChatRequest(BaseModel):
     prompt: str
@@ -25,6 +25,10 @@ class ChatRequest(BaseModel):
 
 class ClearRequest(BaseModel):
     phone_number: Optional[str] = None
+
+class GlobalUpdateItem(BaseModel):
+    client_id: str
+    state_bytes_base64: str
 
 # Global handle for cloudflared process
 tunnel_process: Optional[subprocess.Popen] = None
@@ -51,7 +55,6 @@ def start_cloudflare_tunnel() -> Optional[str]:
             stderr=subprocess.STDOUT
         )
         
-        # Wait up to 15 seconds to extract the trycloudflare.com URL
         url: Optional[str] = None
         for i in range(15):
             time.sleep(1)
@@ -63,12 +66,7 @@ def start_cloudflare_tunnel() -> Optional[str]:
                         url = match.group(0)
                         break
         log_file.close()
-        
-        if url:
-            return url
-        else:
-            print("Failed to extract Cloudflare tunnel URL from tunnel.log.", flush=True)
-            return None
+        return url
     except Exception as ex:
         print(f"Failed to start cloudflared tunnel process: {ex}", flush=True)
         return None
@@ -251,10 +249,10 @@ def shutdown_timer(pat: str, org: str, repo_name: str, duration_hours: float) ->
     os._exit(0)
 
 # ---------------------------------------------------------------------------
-# Startup Event
+# Lifespan Events Handler (Startup & Shutdown)
 # ---------------------------------------------------------------------------
-@app.on_event("startup")
-def startup_event() -> None:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     pat: str = os.getenv("GITHUB_PAT", "")
     org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
 
@@ -308,6 +306,11 @@ def startup_event() -> None:
             print("Warning: GITHUB_PAT not configured. Skipping DNS config.json registration.", flush=True)
     else:
         print("Running server without public tunnel.", flush=True)
+        
+    yield
+    # No custom shutdown tasks needed outside the daemon shutdown loop
+
+app = FastAPI(title="Local GGUF LLM API Server", lifespan=lifespan)
 
 # ---------------------------------------------------------------------------
 # Endpoints
