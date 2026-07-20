@@ -19,11 +19,12 @@ app: FastAPI = FastAPI(title="Local GGUF LLM API Server")
 
 class ChatRequest(BaseModel):
     prompt: str
-    jid: Optional[str] = None
+    client_id: Optional[str] = None
+    phone_number: Optional[str] = None
     image_base64: Optional[str] = None
 
 class ClearRequest(BaseModel):
-    jid: Optional[str] = None
+    phone_number: Optional[str] = None
 
 # Global handle for cloudflared process
 tunnel_process: Optional[subprocess.Popen] = None
@@ -73,88 +74,129 @@ def start_cloudflare_tunnel() -> Optional[str]:
         return None
 
 # ---------------------------------------------------------------------------
-# GitHub DNS Updater & Dispatcher
+# GitHub DNS Updater & Dispatcher (Via Cloudflare Worker)
 # ---------------------------------------------------------------------------
 def update_github_dns(pat: str, org: str, public_url: str, repo_name: str) -> None:
-    print(f"Connecting to GitHub using PAT to update dynamic DNS registry...", flush=True)
     max_attempts: int = 5
+    match = re.match(r"^(.*?)-(\d+)$", repo_name)
+    superkey = match.group(1) if match else MODEL_CODE
+    
+    dns_key = f"{superkey}/{repo_name}"
+    print(f"Updating dynamic DNS registry via Cloudflare Worker... Key: {dns_key}", flush=True)
+    
     for attempt in range(1, max_attempts + 1):
         try:
-            auth_obj: Auth.Token = Auth.Token(pat)
-            g: Github = Github(auth=auth_obj)
-            
-            # Target dns repository
-            target_repo_name: str = "dns"
-            full_repo_path: str = f"{org}/{target_repo_name}"
-            
-            repo = g.get_repo(full_repo_path)
-            
-            # Get current config.json contents
-            try:
-                contents = repo.get_contents("config.json")
-                config_bytes: bytes = base64.b64decode(contents.content)
-                sha: str = contents.sha
-                try:
-                    config_data: dict = json.loads(config_bytes.decode("utf-8"))
-                    print("Successfully loaded existing config.json.", flush=True)
-                except Exception as parse_err:
-                    print(f"Warning: config.json content was not valid JSON ({parse_err}). Initializing fresh dictionary.", flush=True)
-                    config_data = {}
-            except UnknownObjectException:
-                config_data = {}
-                sha = ""
-                print("config.json not found in dns repo. Creating a fresh registry.", flush=True)
-
-            # Resolve the sub-dictionary key prefix from repo_name dynamically
-            # e.g. "private-model-1" -> "private-model", "2bm-1" -> "2bm", "0bm-1" -> "0bm"
-            import re
-            match = re.match(r"^(.*?)-\d+$", repo_name)
-            if match:
-                model_code_to_write = match.group(1)
+            payload = {"key": dns_key, "value": public_url}
+            res = requests.post("https://dns-manager.aakashmishra2050880.workers.dev/update", json=payload, timeout=10)
+            if res.status_code == 200:
+                print(f"DNS updated successfully for key '{dns_key}' with URL {public_url}", flush=True)
+                return
             else:
-                model_code_to_write = MODEL_CODE
-
-            # Set key under the specific model code sub-dictionary
-            if model_code_to_write not in config_data:
-                config_data[model_code_to_write] = {}
-            
-            # Keep config_data dict clean: remove old flat key if it exists
-            if repo_name in config_data:
-                del config_data[repo_name]
-                
-            # Remove key from other categories dynamically to prevent cross-contamination
-            for key in list(config_data.keys()):
-                if key != model_code_to_write and isinstance(config_data[key], dict) and repo_name in config_data[key]:
-                    del config_data[key][repo_name]
-                
-            config_data[model_code_to_write][repo_name] = public_url
-            updated_json: str = json.dumps(config_data, indent=2)
-            
-            if sha:
-                repo.update_file(
-                    path="config.json",
-                    message=f"Update {repo_name} endpoint tunnel DNS URL [automated]",
-                    content=updated_json,
-                    sha=sha
-                )
-                print(f"config.json updated successfully with key '{repo_name}'.", flush=True)
-            else:
-                repo.create_file(
-                    path="config.json",
-                    message=f"Create tunnel DNS registry config.json with key '{repo_name}' [automated]",
-                    content=updated_json
-                )
-                print(f"config.json created successfully with key '{repo_name}'.", flush=True)
-            return
+                print(f"CF Worker returned status code {res.status_code}: {res.text}", flush=True)
         except Exception as e:
             import random
-            print(f"Error updating GitHub DNS file (attempt {attempt}/{max_attempts}): {e}", flush=True)
-            if attempt < max_attempts:
-                sleep_time = random.uniform(2.0, 7.0)
-                print(f"Retrying DNS update in {sleep_time:.2f} seconds...", flush=True)
-                time.sleep(sleep_time)
-            else:
-                print("All DNS update attempts failed.", flush=True)
+            print(f"Error updating DNS (attempt {attempt}/{max_attempts}): {e}", flush=True)
+            time.sleep(random.uniform(2.0, 5.0))
+
+def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
+    """
+    Stitches all local SSD state files and uploads them to the Standby Server.
+    """
+    print(f"[Handoff] Gathering local cached states to sync to Standby Server...", flush=True)
+    try:
+        # Resolve Standby Server URL from public raw config.json
+        res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
+        if res_dns.status_code != 200:
+            print(f"[Handoff] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})", flush=True)
+            return
+            
+        config_data = res_dns.json()
+        standby_url: Optional[str] = config_data.get("standby", {}).get("standby-server")
+        
+        if not standby_url:
+            print("[Handoff] Standby Server URL not found in registry. Handoff sync aborted.", flush=True)
+            return
+
+        # 1. Gather Client Globals
+        globals_list = []
+        global_cache_dir = Path("global_cache")
+        if global_cache_dir.exists():
+            for path in global_cache_dir.glob("*.bin"):
+                client_id = path.stem
+                with open(path, "rb") as f:
+                    file_bytes = f.read()
+                b64_str = base64.b64encode(file_bytes).decode("utf-8")
+                globals_list.append({"client_id": client_id, "state_bytes_base64": b64_str})
+
+        # 2. Gather Phone States
+        phones_list = []
+        from model import STATES_DIR
+        if STATES_DIR.exists():
+            for path in STATES_DIR.glob("*.bin"):
+                phone_num = path.stem
+                with open(path, "rb") as f:
+                    file_bytes = f.read()
+                b64_str = base64.b64encode(file_bytes).decode("utf-8")
+                phones_list.append({"phone_number": phone_num, "state_bytes_base64": b64_str})
+
+        # Send payload to standby server
+        payload = {
+            "model_id": repo_name,
+            "globals": globals_list,
+            "phones": phones_list
+        }
+        res = requests.post(f"{standby_url.rstrip('/')}/v1/sync", json=payload, timeout=30)
+        if res.status_code == 200:
+            print("[Handoff] Handoff sync payload uploaded to Standby Server successfully.", flush=True)
+        else:
+            print(f"[Handoff] Standby Server returned error {res.status_code}: {res.text}", flush=True)
+    except Exception as e:
+        print(f"[Handoff] Failed to sync to Standby Server: {e}", flush=True)
+
+def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
+    """
+    Queries the Standby Server on boot to pull back active states and restore DNS.
+    """
+    print(f"[Startup Recovery] Recovering states from Standby Server for {repo_name}...", flush=True)
+    try:
+        res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
+        if res_dns.status_code != 200:
+            print(f"[Startup Recovery] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})", flush=True)
+            return
+            
+        config_data = res_dns.json()
+        standby_url: Optional[str] = config_data.get("standby", {}).get("standby-server")
+        
+        if not standby_url:
+            print("[Startup Recovery] Standby Server URL not found. Running clean start.", flush=True)
+            return
+
+        res = requests.get(f"{standby_url.rstrip('/')}/v1/get-sync?model_id={repo_name}", timeout=30)
+        if res.status_code == 200:
+            data = res.json()
+            
+            # Write global caches
+            global_cache_dir = Path("global_cache")
+            global_cache_dir.mkdir(exist_ok=True)
+            for item in data.get("globals", []):
+                client_id = item["client_id"]
+                file_bytes = base64.b64decode(item["state_bytes_base64"])
+                with open(global_cache_dir / f"{client_id}.bin", "wb") as f:
+                    f.write(file_bytes)
+                    
+            # Write phone convo caches
+            from model import STATES_DIR
+            STATES_DIR.mkdir(exist_ok=True)
+            for item in data.get("phones", []):
+                phone_num = item["phone_number"]
+                file_bytes = base64.b64decode(item["state_bytes_base64"])
+                with open(STATES_DIR / f"{phone_num}.bin", "wb") as f:
+                    f.write(file_bytes)
+            print(f"[Startup Recovery] Restored {len(data.get('phones', []))} conversation states from Standby Server.", flush=True)
+        else:
+            print(f"[Startup Recovery] Standby Server returned {res.status_code}. No backup found.", flush=True)
+    except Exception as e:
+        print(f"[Startup Recovery] Warning: Recovery failed: {e}", flush=True)
 
 def trigger_self_workflow(pat: str, org: str, repo_name: str) -> None:
     print(f"Triggering self workflow dispatch for repository {repo_name}...", flush=True)
@@ -173,19 +215,28 @@ def trigger_self_workflow(pat: str, org: str, repo_name: str) -> None:
 
 def shutdown_timer(pat: str, org: str, repo_name: str, duration_hours: float) -> None:
     duration_seconds: float = duration_hours * 3600
-    print(f"Graceful shutdown timer started: Server will run for {duration_hours} hours ({duration_seconds} seconds).", flush=True)
     
-    time.sleep(duration_seconds)
+    # Calculate handoff sync time (15 minutes before shutdown)
+    sync_lead_time = 15 * 60
+    sleep_first = max(0.0, duration_seconds - sync_lead_time)
+    
+    print(f"Graceful shutdown timer started: Server will run for {duration_hours} hours. Handoff sync in {sleep_first / 60:.1f} minutes.", flush=True)
+    time.sleep(sleep_first)
+    
+    # 1. Trigger handoff sync to standby
+    if pat:
+        trigger_standby_sync(pat, org, repo_name)
+        
+    # Wait remaining 15 minutes
+    print(f"[Handoff] Waiting remaining 15 minutes before runner shutdown...", flush=True)
+    time.sleep(sync_lead_time)
     
     print("Timer expired. Initiating graceful shutdown and restart...", flush=True)
     
-    # 1. Trigger next workflow run
+    # 2. Trigger next workflow run
     if pat and repo_name != "test":
         trigger_self_workflow(pat, org, repo_name)
-    else:
-        print("Local mode or GITHUB_PAT missing, skipping self-dispatch trigger.", flush=True)
         
-    # 2. Short wait to allow dispatch request to register
     time.sleep(5)
     
     # 3. Kill cloudflared tunnel
@@ -193,10 +244,8 @@ def shutdown_timer(pat: str, org: str, repo_name: str, duration_hours: float) ->
     if tunnel_process:
         try:
             tunnel_process.terminate()
-            tunnel_process.wait(timeout=5)
-            print("cloudflared tunnel terminated.", flush=True)
-        except Exception as te:
-            print(f"Error terminating cloudflared: {te}", flush=True)
+        except Exception:
+            pass
         
     print("Exiting server process gracefully with code 0.", flush=True)
     os._exit(0)
@@ -227,99 +276,22 @@ def startup_event() -> None:
     )
     t.start()
 
-    # --- Model Warmup & Global Prefix Pre-caching ---
-    print("[Warmup] Warming up model weights and building global prefix cache...", flush=True)
+    # --- Restore state from Standby Server if recovering ---
+    if pat and repo_name != "test":
+        recover_states_from_standby(pat, org, repo_name)
+
+    # --- Model Warmup ---
+    print("[Warmup] Warming up model weights...", flush=True)
     try:
-        import re
-        import pickle
-        from model import get_llm, STATES_DIR
+        from model import get_llm
+        get_llm()
         
-        system_path = Path("system.md")
-        persona_path = Path("persona.json")
-        kb_path = Path("kb.json")
-        
-        if system_path.exists() and persona_path.exists() and kb_path.exists():
-            import json
-            from chat_template import format_chat_prompt
-            
-            system_prompt = system_path.read_text(encoding="utf-8").strip()
-            persona_raw = persona_path.read_text(encoding="utf-8").strip()
-            kb = kb_path.read_text(encoding="utf-8").strip()
-            
-            # Strip tool declarations
-            clean_system = re.sub(r"## TOOL USE[\s\S]*?(?=##|$)", "", system_prompt)
-            
-            # Format persona exactly like auto-reply.ts
-            try:
-                persona_data = json.loads(persona_raw)
-                if isinstance(persona_data.get("persona"), dict):
-                    persona = "\n".join(f"- {k.replace('_', ' ')}: {v}" for k, v in persona_data["persona"].items())
-                else:
-                    persona = str(persona_data.get("persona", "none"))
-            except Exception:
-                persona = "none"
-            
-            # Format raw prefix exactly like buildPrompt
-            prompt_parts = [
-                "System Prompt:",
-                clean_system,
-                "",
-                "Persona:",
-                persona,
-                "",
-                "Knowledge Base (Authoritative Facts):",
-                kb,
-                "",
-                "Conversation History:",
-                "none",
-                "",
-                "Current Query:",
-                "Hi",
-                "",
-                "Instruction: Answer the customer's query using only the facts in the Knowledge Base above. Be helpful, polite, and professional.",
-                "",
-                "Assistant:"
-            ]
-            prompt_text = "\n".join(prompt_parts)
-            formatted_prefix = format_chat_prompt(prompt_text)
-            
-            llm = get_llm()
-            prefix_tokens = llm.tokenize(formatted_prefix.encode("utf-8"))
-            
-            state_file = STATES_DIR / "global_prefix.state"
-            
-            # Check if valid cache exists
-            cache_valid = False
-            if state_file.exists():
-                try:
-                    with open(state_file, "rb") as sf:
-                        raw_data = pickle.load(sf)
-                    cached_tokens = raw_data["tokens"]
-                    if cached_tokens == prefix_tokens:
-                        cache_valid = True
-                except Exception:
-                    cache_valid = False
-            
-            if cache_valid:
-                print(f"[Warmup] Found valid global prefix cache ({len(prefix_tokens)} tokens). Skipping evaluation.", flush=True)
-            else:
-                print(f"[Warmup] Cache invalid or missing. Compiling global prefix cache ({len(prefix_tokens)} tokens)...", flush=True)
-                llm.reset()
-                llm.eval(prefix_tokens)
-                
-                # Write state files
-                state_data = llm.save_state()
-                with open(state_file, "wb") as sf:
-                    pickle.dump({"state": state_data, "tokens": prefix_tokens}, sf)
-                print(f"[Warmup] Inline global prefix cache compiled and saved to disk.", flush=True)
-            
-            print(f"[Warmup] Warmup phase complete.", flush=True)
-        else:
-            print("[Warmup] Warning: Warmup files system.md/persona.json/kb.json not found on disk. Performing fallback query...", flush=True)
-            warmup_res = run_model_query("Hi")
-            print(f"[Warmup] Fallback query completed: {warmup_res[:40].strip()!r}", flush=True)
+        # Create global_cache directory
+        global_cache_dir = Path("global_cache")
+        global_cache_dir.mkdir(exist_ok=True)
+        print("[Warmup] Model initialized successfully.", flush=True)
     except Exception as warmup_err:
-        print(f"[Warmup] Warning: global prefix caching failed: {warmup_err}", flush=True)
+        print(f"[Warmup] Warning: model warmup failed: {warmup_err}", flush=True)
 
     # Start Cloudflare Quick Tunnel
     public_url: Optional[str] = start_cloudflare_tunnel()
@@ -329,7 +301,7 @@ def startup_event() -> None:
         print(f"Public API Address: {public_url}", flush=True)
         print(f"==================================================", flush=True)
         
-        # Write back tunnel DNS to config.json
+        # Write back tunnel DNS to config.json (Re-registers itself to original slot)
         if pat:
             update_github_dns(pat, org, public_url, repo_name)
         else:
@@ -345,26 +317,45 @@ async def chat(req: ChatRequest) -> dict:
     if not req.prompt:
         raise HTTPException(status_code=400, detail="Prompt parameter is required.")
     
-    response_text: str = await run_model_query(req.prompt, req.jid, req.image_base64)
+    response_text: str = await run_model_query(req.prompt, req.client_id, req.phone_number, req.image_base64)
     return {
         "response": response_text,
         "prompt": req.prompt
     }
 
+@app.post("/v1/global-update")
+def receive_global_update(req: GlobalUpdateItem) -> dict:
+    """
+    Receives and caches a client's global pre-compiled prefix state.
+    """
+    try:
+        global_cache_dir = Path("global_cache")
+        global_cache_dir.mkdir(exist_ok=True)
+        
+        file_bytes = base64.b64decode(req.state_bytes_base64)
+        state_file = global_cache_dir / f"{req.client_id}.bin"
+        
+        with open(state_file, "wb") as f:
+            f.write(file_bytes)
+            
+        print(f"[Model] Successfully updated global cache for client: {req.client_id}", flush=True)
+        return {"success": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/v1/chat/clear")
 async def clear_chat_state(req: ClearRequest) -> dict:
     try:
         from model import STATES_DIR
-        if req.jid:
-            state_file = STATES_DIR / f"{req.jid}.state"
+        if req.phone_number:
+            state_file = STATES_DIR / f"{req.phone_number}.bin"
             if state_file.exists():
                 state_file.unlink()
-                print(f"[Model] Cleared conversation history cache for JID: {req.jid}", flush=True)
+                print(f"[Model] Cleared conversation history cache for phone: {req.phone_number}", flush=True)
         else:
-            for path in STATES_DIR.glob("*.state"):
-                if path.name != "global_prefix.state":
-                    path.unlink()
-            print("[Model] Cleared all JID conversation history caches", flush=True)
+            for path in STATES_DIR.glob("*.bin"):
+                path.unlink()
+            print("[Model] Cleared all phone conversation history caches", flush=True)
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
