@@ -114,6 +114,8 @@ def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
             print("[Handoff] Standby Server URL not found in registry. Handoff sync aborted.", flush=True)
             return
 
+        import gzip
+
         # 1. Gather Client Globals
         globals_list = []
         global_cache_dir = Path("global_cache")
@@ -122,7 +124,8 @@ def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
                 client_id = path.stem
                 with open(path, "rb") as f:
                     file_bytes = f.read()
-                b64_str = base64.b64encode(file_bytes).decode("utf-8")
+                compressed_bytes = gzip.compress(file_bytes)
+                b64_str = base64.b64encode(compressed_bytes).decode("utf-8")
                 globals_list.append({"client_id": client_id, "state_bytes_base64": b64_str})
 
         # 2. Gather Phone States
@@ -133,7 +136,8 @@ def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
                 phone_num = path.stem
                 with open(path, "rb") as f:
                     file_bytes = f.read()
-                b64_str = base64.b64encode(file_bytes).decode("utf-8")
+                compressed_bytes = gzip.compress(file_bytes)
+                b64_str = base64.b64encode(compressed_bytes).decode("utf-8")
                 phones_list.append({"phone_number": phone_num, "state_bytes_base64": b64_str})
 
         # Send payload to standby server
@@ -171,6 +175,7 @@ def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
         res = requests.get(f"{standby_url.rstrip('/')}/v1/get-sync?model_id={repo_name}", timeout=30)
         if res.status_code == 200:
             data = res.json()
+            import gzip
             
             # Write global caches
             global_cache_dir = Path("global_cache")
@@ -178,8 +183,12 @@ def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
             for item in data.get("globals", []):
                 client_id = item["client_id"]
                 file_bytes = base64.b64decode(item["state_bytes_base64"])
+                try:
+                    decompressed = gzip.decompress(file_bytes)
+                except Exception:
+                    decompressed = file_bytes
                 with open(global_cache_dir / f"{client_id}.bin", "wb") as f:
-                    f.write(file_bytes)
+                    f.write(decompressed)
                     
             # Write phone convo caches
             from model import STATES_DIR
@@ -187,8 +196,12 @@ def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
             for item in data.get("phones", []):
                 phone_num = item["phone_number"]
                 file_bytes = base64.b64decode(item["state_bytes_base64"])
+                try:
+                    decompressed = gzip.decompress(file_bytes)
+                except Exception:
+                    decompressed = file_bytes
                 with open(STATES_DIR / f"{phone_num}.bin", "wb") as f:
-                    f.write(file_bytes)
+                    f.write(decompressed)
             print(f"[Startup Recovery] Restored {len(data.get('phones', []))} conversation states from Standby Server.", flush=True)
         else:
             print(f"[Startup Recovery] Standby Server returned {res.status_code}. No backup found.", flush=True)
@@ -335,10 +348,19 @@ def receive_global_update(req: GlobalUpdateItem) -> dict:
         global_cache_dir.mkdir(exist_ok=True)
         
         file_bytes = base64.b64decode(req.state_bytes_base64)
+        
+        import gzip
+        try:
+            decompressed_bytes = gzip.decompress(file_bytes)
+            print(f"[Model] Decompressed global state from {len(file_bytes)} to {len(decompressed_bytes)} bytes.", flush=True)
+        except Exception:
+            # Fallback if raw uncompressed data was sent
+            decompressed_bytes = file_bytes
+            
         state_file = global_cache_dir / f"{req.client_id}.bin"
         
         with open(state_file, "wb") as f:
-            f.write(file_bytes)
+            f.write(decompressed_bytes)
             
         print(f"[Model] Successfully updated global cache for client: {req.client_id}", flush=True)
         return {"success": True}
