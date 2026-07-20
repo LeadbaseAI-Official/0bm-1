@@ -2,11 +2,22 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 from llama_cpp import Llama, GGML_TYPE_Q8_0
 from chat_template import format_chat_prompt
+import pickle
+import threading
+import os
+import asyncio
+
+# Create states directory
+STATES_DIR = Path("states")
+STATES_DIR.mkdir(parents=True, exist_ok=True)
+
+_llm_lock = asyncio.Lock()
+_llm_instance: Optional[Llama] = None
+_states: Dict[str, Any] = {}
+
 
 MODEL_CODE = "0bm"
 
-_llm_instance: Optional[Llama] = None
-_states: Dict[str, Any] = {}
 
 def find_gguf_file() -> Path:
     # Check current directory
@@ -61,16 +72,6 @@ def get_llm() -> Llama:
         )
     return _llm_instance
 
-import pickle
-import threading
-import os
-import asyncio
-
-# Create states directory
-STATES_DIR = Path("states")
-STATES_DIR.mkdir(parents=True, exist_ok=True)
-
-_llm_lock = asyncio.Lock()
 
 def save_state_bg(state_file: Path, state_obj: Any, tokens: list) -> None:
     try:
@@ -82,7 +83,7 @@ def save_state_bg(state_file: Path, state_obj: Any, tokens: list) -> None:
     except Exception as e:
         print(f"[Model] Background state save warning: {e}", flush=True)
 
-async def run_model_query(prompt: str, jid: Optional[str] = None, image_base64: Optional[str] = None) -> str:
+async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_number: Optional[str] = None, image_base64: Optional[str] = None) -> str:
     async with _llm_lock:
         def evaluate_query() -> str:
             nonlocal prompt, image_base64
@@ -94,7 +95,6 @@ async def run_model_query(prompt: str, jid: Optional[str] = None, image_base64: 
                     if not image_base64.startswith("data:image"):
                         image_base64 = f"data:image/jpeg;base64,{image_base64}"
                     
-                    # Apply logit_bias to ban <|channel>thought token generation
                     logit_bias = {}
                     try:
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
@@ -133,82 +133,39 @@ async def run_model_query(prompt: str, jid: Optional[str] = None, image_base64: 
                     
                     formatted_prompt: str = format_chat_prompt(prompt)
                     new_tokens = llm.tokenize(formatted_prompt.encode("utf-8"))
-                    print(f"[Model] Received query prompt. Token count: {len(new_tokens)} tokens.", flush=True)
                     
-                    state_file = STATES_DIR / f"{jid}.state" if jid else None
-                    common_len = 0
+                    # Ensure dynamic folders exist
+                    global_cache_dir = Path("global_cache")
+                    global_cache_dir.mkdir(exist_ok=True)
                     
-                    # 1. First, try loading the specific JID cache state
-                    if jid and state_file.exists():
+                    # 1. Load Client Global Cache first (pre-compiled prefix)
+                    global_cache_file = global_cache_dir / f"{client_id}.bin" if client_id else None
+                    loaded_global = False
+                    
+                    if global_cache_file and global_cache_file.exists():
                         try:
-                            with open(state_file, "rb") as sf:
-                                raw_data = pickle.load(sf)
-                            cached_tokens = raw_data["tokens"]
-                            
-                            for t1, t2 in zip(cached_tokens, new_tokens):
-                                if t1 != t2:
-                                    break
-                                common_len += 1
-                                
-                            if common_len > 0:
-                                llm.load_state(raw_data["state"])
-                                print(f"[Model] Restored cache state for JID: {jid} (prefix matched: {common_len}/{len(cached_tokens)} tokens)", flush=True)
-                            else:
-                                print(f"[Model] Cache files exist for JID {jid} but matched 0 tokens. Cache mismatch.", flush=True)
-                        except Exception as cache_err:
-                            print(f"[Model] Warning: Failed to load cache state for JID {jid}: {cache_err}. Deleting invalid cache.", flush=True)
-                            try:
-                                state_file.unlink()
-                            except Exception:
-                                pass
-                            common_len = 0
+                            print(f"[Model] Restoring client global cache: {global_cache_file.name}", flush=True)
+                            with open(global_cache_file, "rb") as f:
+                                global_state = pickle.load(f)
+                            llm.load_state(global_state)
+                            loaded_global = True
+                        except Exception as e:
+                            print(f"[Model] Warning: Failed to load global cache: {e}", flush=True)
+                            llm.reset()
                     else:
-                        if jid:
-                            print(f"[Model] No specific cache files found for JID: {jid}", flush=True)
-                    
-                    # 2. If JID cache missed, fall back to the pre-cached global prefix
-                    if common_len == 0:
-                        global_state = STATES_DIR / "global_prefix.state"
-                        if global_state.exists():
-                            try:
-                                with open(global_state, "rb") as sf:
-                                    raw_data = pickle.load(sf)
-                                cached_tokens = raw_data["tokens"]
-                                
-                                for t1, t2 in zip(cached_tokens, new_tokens):
-                                    if t1 != t2:
-                                        break
-                                    common_len += 1
-                                    
-                                if common_len > 0:
-                                    llm.load_state(raw_data["state"])
-                                    print(f"[Model] Restored cache from global prefix cache (prefix matched: {common_len}/{len(cached_tokens)} tokens)", flush=True)
-                                    if common_len < len(cached_tokens):
-                                        print(f"[Model] Cache mismatch at token {common_len}!", flush=True)
-                                        try:
-                                            matched_part = llm.detokenize(cached_tokens[max(0, common_len-10):common_len]).decode("utf-8", errors="replace")
-                                            cached_diff = llm.detokenize(cached_tokens[common_len:common_len+20]).decode("utf-8", errors="replace")
-                                            new_diff = llm.detokenize(new_tokens[common_len:common_len+20]).decode("utf-8", errors="replace")
-                                            print(f"[Model] Last matched: {repr(matched_part)}", flush=True)
-                                            print(f"[Model] Cached expected:  {repr(cached_diff)}", flush=True)
-                                            print(f"[Model] New query got:    {repr(new_diff)}", flush=True)
-                                        except Exception as diff_err:
-                                            print(f"[Model] Failed to print mismatch details: {diff_err}", flush=True)
-                                else:
-                                    print(f"[Model] Global prefix cache exists but matched 0 tokens against current prompt.", flush=True)
-                            except Exception as glob_err:
-                                print(f"[Model] Warning: Failed to load global prefix cache: {glob_err}. Rebuilding state...", flush=True)
-                                try:
-                                    global_state.unlink()
-                                except Exception:
-                                    pass
-                                common_len = 0
-                        else:
-                            print(f"[Model] No pre-cached global prefix files found at {global_state}", flush=True)
-                                
-                    if common_len == 0:
                         llm.reset()
-                        print(f"[Model] Cache miss/fresh start for JID: {jid}. Prompt must be evaluated from scratch.", flush=True)
+                        print("[Model] No client global cache found, running from scratch.", flush=True)
+                    
+                    # 2. Load User Convo History cache on top of the global prefix
+                    convo_file = STATES_DIR / f"{phone_number}.bin" if phone_number else None
+                    if convo_file and convo_file.exists() and loaded_global:
+                        try:
+                            print(f"[Model] Stapling conversation history: {convo_file.name}", flush=True)
+                            with open(convo_file, "rb") as f:
+                                convo_state = pickle.load(f)
+                            llm.load_state(convo_state)
+                        except Exception as e:
+                            print(f"[Model] Warning: Failed to restore conversation history: {e}", flush=True)
                     
                     # Apply logit_bias to ban <|channel>thought token generation
                     logit_bias = {}
@@ -234,22 +191,21 @@ async def run_model_query(prompt: str, jid: Optional[str] = None, image_base64: 
                     print("\n[Model] Generation complete.", flush=True)
                     text_result = "".join(text_result_chunks)
                     
-                    if jid:
+                    # 3. Save updated conversation state (containing new query + reply)
+                    if phone_number:
                         try:
-                            state_data = llm.save_state()
+                            state_obj = llm.save_state()
                             full_evaluated_text = formatted_prompt + text_result
                             full_tokens = llm.tokenize(full_evaluated_text.encode("utf-8"))
                             
                             t = threading.Thread(
                                 target=save_state_bg,
-                                args=(state_file, state_data, full_tokens),
+                                args=(convo_file, state_obj, full_tokens),
                                 daemon=True
                             )
                             t.start()
                         except Exception as save_err:
-                            print(f"[Model] Warning: Failed to save cache state for JID {jid}: {save_err}", flush=True)
-                            import traceback
-                            traceback.print_exc()
+                            print(f"[Model] Warning: Failed to save updated state: {save_err}", flush=True)
                     
                 return text_result
             except Exception as e:
