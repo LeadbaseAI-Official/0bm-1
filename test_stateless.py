@@ -50,14 +50,15 @@ def run_benchmark() -> None:
     # 2. Save state using llama.cpp state API
     print("[4/5] Saving context state to SSD buffer ...")
     t_save_start = time.time()
-    state_data = llm.save_state()
+    state_obj = llm.save_state()
     t_save_end = time.time()
-    print(f"State saved in {t_save_end - t_save_start:.4f} seconds (Size: {len(state_data) / (1024*1024):.2f} MB).")
+    print(f"State saved in {t_save_end - t_save_start:.4f} seconds.")
 
     # Save to disk as a benchmark check
+    import pickle
     state_file = Path("test_convo.bin")
     with open(state_file, "wb") as f:
-        f.write(state_data)
+        pickle.dump(state_obj, f)
 
     # Reset context to simulate clear stateless slot
     llm.reset()
@@ -66,8 +67,8 @@ def run_benchmark() -> None:
     print("[5/5] Restoring context state from SSD binary ...")
     t_load_start = time.time()
     with open(state_file, "rb") as f:
-        loaded_state_data = f.read()
-    llm.load_state(loaded_state_data)
+        loaded_state_obj = pickle.load(f)
+    llm.load_state(loaded_state_obj)
     print(f"State restored in {time.time() - t_load_start:.4f} seconds.")
 
     # 4. Generate next 200 tokens
