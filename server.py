@@ -71,15 +71,14 @@ def start_cloudflare_tunnel() -> Optional[str]:
         print(f"Failed to start cloudflared tunnel process: {ex}", flush=True)
         return None
 
+SUPERKEY = "0bm"
+
 # ---------------------------------------------------------------------------
 # GitHub DNS Updater & Dispatcher (Via Cloudflare Worker)
 # ---------------------------------------------------------------------------
 def update_github_dns(pat: str, org: str, public_url: str, repo_name: str) -> None:
     max_attempts: int = 5
-    match = re.match(r"^(.*?)-(\d+)$", repo_name)
-    superkey = match.group(1) if match else MODEL_CODE
-    
-    dns_key = f"{superkey}/{repo_name}"
+    dns_key = f"{SUPERKEY}/{repo_name}"
     print(f"Updating dynamic DNS registry via Cloudflare Worker... Key: {dns_key}", flush=True)
     
     for attempt in range(1, max_attempts + 1):
@@ -109,7 +108,7 @@ def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
             return
             
         config_data = res_dns.json()
-        standby_url: Optional[str] = config_data.get("standby", {}).get("standby-server")
+        standby_url: Optional[str] = config_data.get("standby-server", {}).get("standby-server")
         
         if not standby_url:
             print("[Handoff] Standby Server URL not found in registry. Handoff sync aborted.", flush=True)
@@ -163,7 +162,7 @@ def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
             return
             
         config_data = res_dns.json()
-        standby_url: Optional[str] = config_data.get("standby", {}).get("standby-server")
+        standby_url: Optional[str] = config_data.get("standby-server", {}).get("standby-server")
         
         if not standby_url:
             print("[Startup Recovery] Standby Server URL not found. Running clean start.", flush=True)
