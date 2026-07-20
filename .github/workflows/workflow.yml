@@ -94,6 +94,14 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run Performance Benchmark
+      - name: Download cloudflared
         run: |
-          .venv/bin/python test_stateless.py
+          wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
+          chmod +x cloudflared
+
+      - name: Start FastAPI Server
+        env:
+          GITHUB_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_ORG: ${{ secrets.GH_ORG }}
+        run: |
+          .venv/bin/python -u server.py
