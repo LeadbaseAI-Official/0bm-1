@@ -7,6 +7,7 @@ import subprocess
 import uvicorn
 import threading
 import requests
+import datetime
 from typing import Optional
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
@@ -15,7 +16,7 @@ from github import Github, Auth
 from github.GithubException import UnknownObjectException
 from contextlib import asynccontextmanager
 
-from model import run_model_query, MODEL_CODE
+from model import run_model_query, MODEL_CODE, log_message
 
 class ChatRequest(BaseModel):
     prompt: str
@@ -43,10 +44,10 @@ def start_cloudflare_tunnel() -> Optional[str]:
     try:
         subprocess.run([cmd, "--version"], capture_output=True, check=True)
     except Exception as e:
-        print(f"cloudflared binary not found or not working: {e}. Running without tunnel.", flush=True)
+        log_message("system", f"cloudflared binary not found or not working: {e}. Running without tunnel.")
         return None
 
-    print(f"Starting cloudflared tunnel using: {cmd}", flush=True)
+    log_message("system", f"Starting cloudflared tunnel using: {cmd}")
     try:
         log_file = open("tunnel.log", "w")
         tunnel_process = subprocess.Popen(
@@ -68,7 +69,7 @@ def start_cloudflare_tunnel() -> Optional[str]:
         log_file.close()
         return url
     except Exception as ex:
-        print(f"Failed to start cloudflared tunnel process: {ex}", flush=True)
+        log_message("system", f"Failed to start cloudflared tunnel process: {ex}")
         return None
 
 SUPERKEY = "0bm"
@@ -79,39 +80,35 @@ SUPERKEY = "0bm"
 def update_github_dns(pat: str, org: str, public_url: str, repo_name: str) -> None:
     max_attempts: int = 5
     dns_key = f"{SUPERKEY}/{repo_name}"
-    print(f"Updating dynamic DNS registry via Cloudflare Worker... Key: {dns_key}", flush=True)
+    log_message("system", f"Updating dynamic DNS registry via Cloudflare Worker... Key: {dns_key}")
     
     for attempt in range(1, max_attempts + 1):
         try:
             payload = {"key": dns_key, "value": public_url}
             res = requests.post("https://dns-manager.aakashmishra2050880.workers.dev/update", json=payload, timeout=10)
             if res.status_code == 200:
-                print(f"DNS updated successfully for key '{dns_key}' with URL {public_url}", flush=True)
+                log_message("system", f"DNS updated successfully for key '{dns_key}' with URL {public_url}")
                 return
             else:
-                print(f"CF Worker returned status code {res.status_code}: {res.text}", flush=True)
+                log_message("system", f"CF Worker returned status code {res.status_code}: {res.text}")
         except Exception as e:
             import random
-            print(f"Error updating DNS (attempt {attempt}/{max_attempts}): {e}", flush=True)
+            log_message("system", f"Error updating DNS (attempt {attempt}/{max_attempts}): {e}")
             time.sleep(random.uniform(2.0, 5.0))
 
 def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
-    """
-    Stitches all local SSD state files and uploads them to the Standby Server.
-    """
-    print(f"[Handoff] Gathering local cached states to sync to Standby Server...", flush=True)
+    log_message("system", "[Handoff] Gathering local cached states to sync to Standby Server...")
     try:
-        # Resolve Standby Server URL from public raw config.json
         res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
         if res_dns.status_code != 200:
-            print(f"[Handoff] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})", flush=True)
+            log_message("system", f"[Handoff] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})")
             return
             
         config_data = res_dns.json()
         standby_url: Optional[str] = config_data.get("standby-server", {}).get("standby-server")
         
         if not standby_url:
-            print("[Handoff] Standby Server URL not found in registry. Handoff sync aborted.", flush=True)
+            log_message("system", "[Handoff] Standby Server URL not found in registry. Handoff sync aborted.")
             return
 
         import gzip
@@ -140,7 +137,6 @@ def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
                 b64_str = base64.b64encode(compressed_bytes).decode("utf-8")
                 phones_list.append({"phone_number": phone_num, "state_bytes_base64": b64_str})
 
-        # Send payload to standby server
         payload = {
             "model_id": repo_name,
             "globals": globals_list,
@@ -148,28 +144,25 @@ def trigger_standby_sync(pat: str, org: str, repo_name: str) -> None:
         }
         res = requests.post(f"{standby_url.rstrip('/')}/v1/sync", json=payload, timeout=30)
         if res.status_code == 200:
-            print("[Handoff] Handoff sync payload uploaded to Standby Server successfully.", flush=True)
+            log_message("system", "[Handoff] Handoff sync payload uploaded to Standby Server successfully.")
         else:
-            print(f"[Handoff] Standby Server returned error {res.status_code}: {res.text}", flush=True)
+            log_message("system", f"[Handoff] Standby Server returned error {res.status_code}: {res.text}")
     except Exception as e:
-        print(f"[Handoff] Failed to sync to Standby Server: {e}", flush=True)
+        log_message("system", f"[Handoff] Failed to sync to Standby Server: {e}")
 
 def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
-    """
-    Queries the Standby Server on boot to pull back active states and restore DNS.
-    """
-    print(f"[Startup Recovery] Recovering states from Standby Server for {repo_name}...", flush=True)
+    log_message("system", f"[Startup Recovery] Recovering states from Standby Server for {repo_name}...")
     try:
         res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
         if res_dns.status_code != 200:
-            print(f"[Startup Recovery] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})", flush=True)
+            log_message("system", f"[Startup Recovery] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})")
             return
             
         config_data = res_dns.json()
         standby_url: Optional[str] = config_data.get("standby-server", {}).get("standby-server")
         
         if not standby_url:
-            print("[Startup Recovery] Standby Server URL not found. Running clean start.", flush=True)
+            log_message("system", "[Startup Recovery] Standby Server URL not found. Running clean start.")
             return
 
         res = requests.get(f"{standby_url.rstrip('/')}/v1/get-sync?model_id={repo_name}", timeout=30)
@@ -202,54 +195,48 @@ def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
                     decompressed = file_bytes
                 with open(STATES_DIR / f"{phone_num}.bin", "wb") as f:
                     f.write(decompressed)
-            print(f"[Startup Recovery] Restored {len(data.get('phones', []))} conversation states from Standby Server.", flush=True)
+            log_message("system", f"[Startup Recovery] Restored {len(data.get('phones', []))} conversation states from Standby Server.")
         else:
-            print(f"[Startup Recovery] Standby Server returned {res.status_code}. No backup found.", flush=True)
+            log_message("system", f"[Startup Recovery] Standby Server returned {res.status_code}. No backup found.")
     except Exception as e:
-        print(f"[Startup Recovery] Warning: Recovery failed: {e}", flush=True)
+        log_message("system", f"[Startup Recovery] Warning: Recovery failed: {e}")
 
 def trigger_self_workflow(pat: str, org: str, repo_name: str) -> None:
-    print(f"Triggering self workflow dispatch for repository {repo_name}...", flush=True)
+    log_message("system", f"Triggering self workflow dispatch for repository {repo_name}...")
     try:
         auth_obj: Auth.Token = Auth.Token(pat)
         g: Github = Github(auth=auth_obj)
         repo = g.get_repo(f"{org}/{repo_name}")
         default_branch: str = repo.default_branch
         
-        # Trigger standard workflow.yml on the default branch
         wf = repo.get_workflow("workflow.yml")
         wf.create_dispatch(default_branch)
-        print("Self workflow dispatch triggered successfully.", flush=True)
+        log_message("system", "Self workflow dispatch triggered successfully.")
     except Exception as e:
-        print(f"Failed to trigger self workflow: {e}", flush=True)
+        log_message("system", f"Failed to trigger self workflow: {e}")
 
 def shutdown_timer(pat: str, org: str, repo_name: str, duration_hours: float) -> None:
     duration_seconds: float = duration_hours * 3600
     
-    # Calculate handoff sync time (15 minutes before shutdown)
     sync_lead_time = 15 * 60
     sleep_first = max(0.0, duration_seconds - sync_lead_time)
     
-    print(f"Graceful shutdown timer started: Server will run for {duration_hours} hours. Handoff sync in {sleep_first / 60:.1f} minutes.", flush=True)
+    log_message("system", f"Graceful shutdown timer started: Server will run for {duration_hours} hours. Handoff sync in {sleep_first / 60:.1f} minutes.")
     time.sleep(sleep_first)
     
-    # 1. Trigger handoff sync to standby
     if pat:
         trigger_standby_sync(pat, org, repo_name)
         
-    # Wait remaining 15 minutes
-    print(f"[Handoff] Waiting remaining 15 minutes before runner shutdown...", flush=True)
+    log_message("system", "[Handoff] Waiting remaining 15 minutes before runner shutdown...")
     time.sleep(sync_lead_time)
     
-    print("Timer expired. Initiating graceful shutdown and restart...", flush=True)
+    log_message("system", "Timer expired. Initiating graceful shutdown and restart...")
     
-    # 2. Trigger next workflow run
     if pat and repo_name != "test":
         trigger_self_workflow(pat, org, repo_name)
         
     time.sleep(5)
     
-    # 3. Kill cloudflared tunnel
     global tunnel_process
     if tunnel_process:
         try:
@@ -257,7 +244,7 @@ def shutdown_timer(pat: str, org: str, repo_name: str, duration_hours: float) ->
         except Exception:
             pass
         
-    print("Exiting server process gracefully with code 0.", flush=True)
+    log_message("system", "Exiting server process gracefully with code 0.")
     os._exit(0)
 
 # ---------------------------------------------------------------------------
@@ -267,12 +254,9 @@ def shutdown_timer(pat: str, org: str, repo_name: str, duration_hours: float) ->
 async def lifespan(app: FastAPI):
     pat: str = os.getenv("GITHUB_PAT", "")
     org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
-
-    # Resolve repo name from standard environment variable
     repo_full: str = os.getenv("GITHUB_REPOSITORY", "")
     repo_name: str = repo_full.split("/")[-1] if "/" in repo_full else "test"
 
-    # Start the shutdown timer thread
     duration_str: str = os.getenv("RUN_DURATION_HOURS", "4.0")
     try:
         duration_hours: float = float(duration_str)
@@ -286,41 +270,32 @@ async def lifespan(app: FastAPI):
     )
     t.start()
 
-    # --- Restore state from Standby Server if recovering ---
     if pat and repo_name != "test":
         recover_states_from_standby(pat, org, repo_name)
 
-    # --- Model Warmup ---
-    print("[Warmup] Warming up model weights...", flush=True)
+    log_message("system", "Warming up model weights...")
     try:
         from model import get_llm
         get_llm()
         
-        # Create global_cache directory
         global_cache_dir = Path("global_cache")
         global_cache_dir.mkdir(exist_ok=True)
-        print("[Warmup] Model initialized successfully.", flush=True)
+        log_message("system", "Model initialized successfully.")
     except Exception as warmup_err:
-        print(f"[Warmup] Warning: model warmup failed: {warmup_err}", flush=True)
+        log_message("system", f"Warning: model warmup failed: {warmup_err}")
 
-    # Start Cloudflare Quick Tunnel
     public_url: Optional[str] = start_cloudflare_tunnel()
     if public_url:
-        print(f"==================================================", flush=True)
-        print(f"CLOUDFLARE TUNNEL ESTABLISHED SUCCESSFULLY!", flush=True)
-        print(f"Public API Address: {public_url}", flush=True)
-        print(f"==================================================", flush=True)
+        log_message("system", f"CLOUDFLARE TUNNEL ESTABLISHED SUCCESSFULLY! Address: {public_url}")
         
-        # Write back tunnel DNS to config.json (Re-registers itself to original slot)
         if pat:
             update_github_dns(pat, org, public_url, repo_name)
         else:
-            print("Warning: GITHUB_PAT not configured. Skipping DNS config.json registration.", flush=True)
+            log_message("system", "Warning: GITHUB_PAT not configured. Skipping DNS registration.")
     else:
-        print("Running server without public tunnel.", flush=True)
+        log_message("system", "Running server without public tunnel.")
         
     yield
-    # No custom shutdown tasks needed outside the daemon shutdown loop
 
 app = FastAPI(title="Local GGUF LLM API Server", lifespan=lifespan)
 
@@ -340,9 +315,6 @@ async def chat(req: ChatRequest) -> dict:
 
 @app.post("/v1/global-update")
 def receive_global_update(req: GlobalUpdateItem) -> dict:
-    """
-    Receives and caches a client's global pre-compiled prefix state.
-    """
     try:
         global_cache_dir = Path("global_cache")
         global_cache_dir.mkdir(exist_ok=True)
@@ -352,9 +324,8 @@ def receive_global_update(req: GlobalUpdateItem) -> dict:
         import gzip
         try:
             decompressed_bytes = gzip.decompress(file_bytes)
-            print(f"[Model] Decompressed global state from {len(file_bytes)} to {len(decompressed_bytes)} bytes.", flush=True)
+            log_message("system", f"Decompressed global state from {len(file_bytes)} to {len(decompressed_bytes)} bytes.")
         except Exception:
-            # Fallback if raw uncompressed data was sent
             decompressed_bytes = file_bytes
             
         state_file = global_cache_dir / f"{req.client_id}.bin"
@@ -362,7 +333,7 @@ def receive_global_update(req: GlobalUpdateItem) -> dict:
         with open(state_file, "wb") as f:
             f.write(decompressed_bytes)
             
-        print(f"[Model] Successfully updated global cache for client: {req.client_id}", flush=True)
+        log_message("system", f"Successfully updated global cache for client: {req.client_id}")
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -375,11 +346,11 @@ async def clear_chat_state(req: ClearRequest) -> dict:
             state_file = STATES_DIR / f"{req.phone_number}.bin"
             if state_file.exists():
                 state_file.unlink()
-                print(f"[Model] Cleared conversation history cache for phone: {req.phone_number}", flush=True)
+                log_message("system", f"Cleared conversation history cache for phone: {req.phone_number}")
         else:
             for path in STATES_DIR.glob("*.bin"):
                 path.unlink()
-            print("[Model] Cleared all phone conversation history caches", flush=True)
+            log_message("system", "Cleared all phone conversation history caches")
         return {"success": True}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
