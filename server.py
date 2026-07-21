@@ -196,10 +196,55 @@ def recover_states_from_standby(pat: str, org: str, repo_name: str) -> None:
                 with open(STATES_DIR / f"{phone_num}.bin", "wb") as f:
                     f.write(decompressed)
             log_message("system", f"[Startup Recovery] Restored {len(data.get('phones', []))} conversation states from Standby Server.")
+            log_message("system", f"[Startup Recovery] Restored {len(data.get('phones', []))} conversation states from Standby Server.")
+            return True
         else:
             log_message("system", f"[Startup Recovery] Standby Server returned {res.status_code}. No backup found.")
     except Exception as e:
         log_message("system", f"[Startup Recovery] Warning: Recovery failed: {e}")
+    return False
+
+def recover_globals_from_redis(org: str) -> None:
+    log_message("system", "[Startup Recovery] Standby recovery missed. Pulling global states from active Redis relay...")
+    try:
+        res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
+        if res_dns.status_code != 200:
+            log_message("system", f"[Startup Recovery] Failed to fetch DNS registry from GitHub raw (Code: {res_dns.status_code})")
+            return
+            
+        config_data = res_dns.json()
+        redis_url: Optional[str] = config_data.get("redis-worker", {}).get("active")
+        
+        if not redis_url:
+            log_message("system", "[Startup Recovery] No active Redis worker registered in DNS config. Running clean start.")
+            return
+            
+        res = requests.get(f"{redis_url.rstrip('/')}/v1/get-all-states", timeout=30)
+        if res.status_code == 200:
+            data = res.json()
+            restored_count = 0
+            
+            global_cache_dir = Path("global_cache")
+            global_cache_dir.mkdir(exist_ok=True)
+            
+            import gzip
+            for key, val in data.items():
+                if key.startswith("global:"):
+                    client_id = key.replace("global:", "", 1)
+                    file_bytes = base64.b64decode(val)
+                    try:
+                        decompressed = gzip.decompress(file_bytes)
+                    except Exception:
+                        decompressed = file_bytes
+                        
+                    with open(global_cache_dir / f"{client_id}.bin", "wb") as f:
+                        f.write(decompressed)
+                    restored_count += 1
+            log_message("system", f"[Startup Recovery] Restored {restored_count} client global states from active Redis.")
+        else:
+            log_message("system", f"[Startup Recovery] Redis returned error code {res.status_code}")
+    except Exception as e:
+        log_message("system", f"[Startup Recovery] Failed to pull from Redis: {e}")
 
 def trigger_self_workflow(pat: str, org: str, repo_name: str) -> None:
     log_message("system", f"Triggering self workflow dispatch for repository {repo_name}...")
@@ -374,7 +419,11 @@ async def lifespan(app: FastAPI):
     lru_thread.start()
 
     if pat and repo_name != "test":
-        recover_states_from_standby(pat, org, repo_name)
+        recovered = recover_states_from_standby(pat, org, repo_name)
+        if not recovered:
+            recover_globals_from_redis(org)
+    elif repo_name == "test":
+        recover_globals_from_redis(org)
 
     log_message("system", "Warming up model weights...")
     try:
