@@ -219,7 +219,7 @@ def recover_globals_from_redis(org: str) -> None:
             log_message("system", "[Startup Recovery] No active Redis worker registered in DNS config. Running clean start.")
             return
             
-        res = requests.get(f"{redis_url.rstrip('/')}/v1/get-all-states", timeout=30)
+        res = requests.get(f"{redis_url.rstrip('/')}/v1/get-all-global-states", timeout=30)
         if res.status_code == 200:
             data = res.json()
             restored_count = 0
