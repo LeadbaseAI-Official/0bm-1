@@ -215,19 +215,26 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         except Exception as e:
                             log_message("system", f"Warning: Failed to restore conversation history: {e}")
                     
-                    # Target token list evaluated so far
+                    # Tokenize the complete prompt sent by the frontend
+                    all_tokens = llm.tokenize(prompt.encode("utf-8"))
+                    
+                    # Target token list evaluated so far in the cache
                     evaluated_tokens = convo_tokens if len(convo_tokens) > 0 else prefix_tokens
                     
-                    # Append new prompt query suffix tokens
-                    full_token_sequence = evaluated_tokens + new_tokens
+                    # Find exact match length between current prompt tokens and cached tokens
+                    match_len = 0
+                    for t1, t2 in zip(all_tokens, evaluated_tokens):
+                        if t1 != t2:
+                            break
+                        match_len += 1
                     
                     # Set current evaluation index inside the context cache
-                    if len(evaluated_tokens) > 0:
-                        llm.n_tokens = len(evaluated_tokens)
-                        log_message("system", f"Recycling KV cache: Preserving {len(evaluated_tokens)} prefix tokens. Appending {len(new_tokens)} suffix tokens.")
+                    if match_len > 0:
+                        llm.n_tokens = match_len
+                        log_message("system", f"Recycling KV cache: Preserving {match_len} prefix tokens. Appending {len(all_tokens) - match_len} suffix tokens.")
                     else:
                         llm.reset()
-                        log_message("system", f"Fresh context run: Evaluating all {len(full_token_sequence)} tokens.")
+                        log_message("system", f"Fresh context run: Evaluating all {len(all_tokens)} tokens.")
 
                     # Apply logit_bias to ban <|channel>thought and <think>/</think> Qwen reasoning tokens
                     logit_bias = {}
@@ -242,9 +249,9 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     except Exception:
                         pass
 
-                    # Stream completion utilizing token array directly to preserve cache mapping
+                    # Stream completion utilizing full token array directly to preserve cache mapping
                     completion_generator = llm.create_completion(
-                        prompt=full_token_sequence,
+                        prompt=all_tokens,
                         max_tokens=512,
                         stream=True,
                         temperature=0.7,
