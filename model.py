@@ -222,6 +222,18 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         except Exception as e:
                             log_message("system", f"Warning: Failed to restore conversation history: {e}")
                     
+                    # Log the exact details of the incoming request and the loaded cache
+                    log_message("system", f"=== RAW PROMPT RECEIVED FROM REQUEST ===\n{prompt}\n========================================")
+                    
+                    # Detokenize prefix_tokens to print the exact text of the loaded system cache
+                    prefix_text = ""
+                    if prefix_tokens:
+                        try:
+                            prefix_text = llm.detokenize(prefix_tokens).decode("utf-8", errors="ignore")
+                        except Exception:
+                            pass
+                    log_message("system", f"=== SYSTEM CACHE PREFIX TEXT ===\n{prefix_text}\n================================")
+
                     # Tokenize the complete prompt sent by the frontend
                     all_tokens = llm.tokenize(formatted_prompt.encode("utf-8"))
                     
