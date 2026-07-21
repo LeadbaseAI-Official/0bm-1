@@ -1,12 +1,13 @@
 from pathlib import Path
 from typing import Optional, Dict, Any
-from llama_cpp import Llama, GGML_TYPE_Q8_0
-from chat_template import format_chat_prompt
+from llama_cpp import Llama, GGML_TYPE_Q8_0 # type: ignore
+from chat_template import format_chat_prompt # type: ignore
 import pickle
 import threading
 import os
 import asyncio
 import datetime
+import requests
 
 # Create states directory
 STATES_DIR = Path("states")
@@ -58,7 +59,7 @@ def get_llm() -> Llama:
         chat_handler = None
         if mmproj_path:
             try:
-                from llama_cpp.llama_chat_format import LlavaChatHandler
+                from llama_cpp.llama_chat_format import LlavaChatHandler # type: ignore
                 log_message("system", f"Found vision projector file: {mmproj_path}")
                 chat_handler = LlavaChatHandler(clip_model_path=str(mmproj_path))
             except Exception as e:
@@ -175,6 +176,30 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     # 2. Load User Convo History cache on top of the global prefix
                     convo_file = STATES_DIR / f"{phone_number}.bin" if phone_number else None
                     convo_tokens = []
+                    
+                    # On-demand state restoration if missing locally
+                    if convo_file and not convo_file.exists() and phone_number and loaded_global:
+                        org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
+                        try:
+                            # Resolve active redis-worker URL
+                            res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
+                            if res_dns.status_code == 200:
+                                redis_url = res_dns.json().get("redis-worker", {}).get("active")
+                                if redis_url:
+                                    log_message("system", f"Local convo cache missing. Querying active Redis for state:{phone_number}...")
+                                    res_redis = requests.get(f"{redis_url.rstrip('/')}/get?key=state:{phone_number}", timeout=10)
+                                    if res_redis.status_code == 200:
+                                        payload = res_redis.json().get("value", "")
+                                        if payload:
+                                            import gzip
+                                            compressed_bytes = base64.b64decode(payload)
+                                            decompressed = gzip.decompress(compressed_bytes)
+                                            with open(convo_file, "wb") as f:
+                                                f.write(decompressed)
+                                            log_message("system", f"Successfully hydrated convo cache for {phone_number} from Redis.")
+                        except Exception as redis_err:
+                            log_message("system", f"Warning: Failed to fetch state for {phone_number} from Redis: {redis_err}")
+
                     if convo_file and convo_file.exists() and loaded_global:
                         try:
                             log_message("system", f"Stapling conversation history: {convo_file.name}")
@@ -196,17 +221,15 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     # Append new prompt query suffix tokens
                     full_token_sequence = evaluated_tokens + new_tokens
                     
+                    # Set current evaluation index inside the context cache
                     if len(evaluated_tokens) > 0:
-                        # Context matches, append ONLY query tokens dynamically without re-processing
                         llm.n_tokens = len(evaluated_tokens)
-                        tokens_to_eval = new_tokens
-                        log_message("system", f"Slicing cache: Skipping first {len(evaluated_tokens)} prefix tokens. Evaluating remaining {len(tokens_to_eval)} suffix tokens.")
+                        log_message("system", f"Recycling KV cache: Preserving {len(evaluated_tokens)} prefix tokens. Appending {len(new_tokens)} suffix tokens.")
                     else:
-                        tokens_to_eval = full_token_sequence
                         llm.reset()
-                        log_message("system", f"Cache mismatch or fresh run. Evaluating all {len(tokens_to_eval)} tokens.")
+                        log_message("system", f"Fresh context run: Evaluating all {len(full_token_sequence)} tokens.")
 
-                    # Apply logit_bias to ban <|channel>thought and <think>/</think> Qwen tokens
+                    # Apply logit_bias to ban <|channel>thought and <think>/</think> Qwen reasoning tokens
                     logit_bias = {}
                     try:
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
@@ -219,12 +242,11 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     except Exception:
                         pass
 
-                    # Evaluate query tokens
-                    llm.eval(tokens_to_eval)
-                    
-                    # Generate response tokens step-by-step
-                    generator = llm.generate(
-                        full_token_sequence,
+                    # Stream completion utilizing token array directly to preserve cache mapping
+                    completion_generator = llm.create_completion(
+                        prompt=full_token_sequence,
+                        max_tokens=512,
+                        stream=True,
                         temp=0.7,
                         top_k=40,
                         top_p=0.9,
@@ -232,20 +254,13 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     )
                     
                     text_result_chunks = []
-                    for token in generator:
-                        if token == llm.token_eos():
-                            break
-                        token_text = llm.detokenize([token]).decode("utf-8", errors="ignore")
-                        
-                        # Stop if model outputs thinking tokens anyway
+                    for chunk in completion_generator:
+                        token_text = chunk["choices"][0]["text"]
+                        # Filter out reasoning tokens if they bypass logit_bias
                         if "<think>" in token_text:
                             continue
-                        
                         text_result_chunks.append(token_text)
                         
-                        if len(text_result_chunks) >= 512:
-                            break
-                            
                     text_result = "".join(text_result_chunks)
                     log_message("response", text_result)
                     
