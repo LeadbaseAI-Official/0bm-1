@@ -139,9 +139,16 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
                         prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
                     
-                    # Formulate query suffix in ChatML format
-                    query_suffix: str = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-                    new_tokens = llm.tokenize(query_suffix.encode("utf-8"))
+                    # Split prompt into System Prefix config and Conversation Suffix
+                    split_marker = "Conversation History:"
+                    if split_marker in prompt:
+                        parts = prompt.split(split_marker, 1)
+                        first_part = parts[0]
+                        second_part = split_marker + parts[1]
+                        # Stitch matching ChatML template sequence
+                        formatted_prompt = f"<|im_start|>system\n{first_part.strip()}\n<|im_end|>\n<|im_start|>user\n{second_part.strip()}"
+                    else:
+                        formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
                     
                     # Ensure dynamic folders exist
                     global_cache_dir = Path("global_cache")
@@ -216,7 +223,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             log_message("system", f"Warning: Failed to restore conversation history: {e}")
                     
                     # Tokenize the complete prompt sent by the frontend
-                    all_tokens = llm.tokenize(prompt.encode("utf-8"))
+                    all_tokens = llm.tokenize(formatted_prompt.encode("utf-8"))
                     
                     # Target token list evaluated so far in the cache
                     evaluated_tokens = convo_tokens if len(convo_tokens) > 0 else prefix_tokens
