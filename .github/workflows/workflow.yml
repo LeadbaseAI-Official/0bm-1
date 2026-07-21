@@ -1,4 +1,4 @@
-name: Run Llama
+name: Run KV Cache Compiler Worker
 
 on:
   workflow_dispatch:
@@ -24,28 +24,6 @@ jobs:
         run: |
           echo "Model cache miss. Downloading GGUF model from Hugging Face..."
           wget -q --show-progress https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q4_K_M.gguf -O Qwen3.5-0.8B-Q4_K_M.gguf
-
-      - name: Cache or Build llama-cli
-        run: |
-          if [ -f "./llama-cli" ]; then
-            echo "llama-cli already exists in repository. Skipping build."
-          else
-            echo "llama-cli not found in repository. Installing build tools and compiling..."
-            sudo apt update && sudo apt install -y cmake build-essential git
-            git clone --depth 1 https://github.com/ggerganov/llama.cpp
-            cmake -B llama.cpp/build llama.cpp
-            cmake --build llama.cpp/build --target llama-cli -j 2
-            cp llama.cpp/build/bin/llama-cli ./
-            rm -rf llama.cpp
-            chmod +x llama-cli
-            
-            echo "Committing and pushing llama-cli to repository..."
-            git config --global user.name "github-actions[bot]"
-            git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add llama-cli
-            git commit -m "chore: cache compiled llama-cli [automated]"
-            git push origin HEAD:main
-          fi
 
       - name: Cache Python Virtual Environment
         id: cache-venv
@@ -99,7 +77,7 @@ jobs:
           wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared
           chmod +x cloudflared
 
-      - name: Start FastAPI Server
+      - name: Start KV Compiler Server
         env:
           GITHUB_PAT: ${{ secrets.GH_PAT }}
           GITHUB_ORG: ${{ secrets.GH_ORG }}
