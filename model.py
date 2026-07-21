@@ -6,6 +6,7 @@ import pickle
 import threading
 import os
 import asyncio
+import datetime
 
 # Create states directory
 STATES_DIR = Path("states")
@@ -15,14 +16,18 @@ _llm_lock = asyncio.Lock()
 _llm_instance: Optional[Llama] = None
 _states: Dict[str, Any] = {}
 
-
 MODEL_CODE = "0bm"
 
+# Standardized logging helper: [HH:MM:SS | DD] [tag] : msg
+def log_message(tag: str, msg: str) -> None:
+    now = datetime.datetime.now()
+    now_str = now.strftime("%H:%M:%S")
+    day_str = now.strftime("%d")
+    print(f"[{now_str} | {day_str}] [{tag}] : {msg}", flush=True)
 
 def find_gguf_file() -> Path:
     # Check current directory
     for path in Path(".").glob("*.gguf"):
-        # Make sure it's not the mmproj file
         if "mmproj" not in path.name:
             return path
     # Check model/ directory
@@ -31,7 +36,6 @@ def find_gguf_file() -> Path:
         for path in model_dir.glob("*.gguf"):
             if "mmproj" not in path.name:
                 return path
-    # Fallback default
     return Path("Qwen3.5-0.8B-Q4_K_M.gguf")
 
 def find_mmproj_file() -> Optional[Path]:
@@ -55,12 +59,12 @@ def get_llm() -> Llama:
         if mmproj_path:
             try:
                 from llama_cpp.llama_chat_format import LlavaChatHandler
-                print(f"[Model] Found vision projector file: {mmproj_path}", flush=True)
+                log_message("system", f"Found vision projector file: {mmproj_path}")
                 chat_handler = LlavaChatHandler(clip_model_path=str(mmproj_path))
             except Exception as e:
-                print(f"[Model] Warning: Failed to load LlavaChatHandler: {e}", flush=True)
+                log_message("system", f"Warning: Failed to load LlavaChatHandler: {e}")
         
-        # Optimize for 2-core GitHub Action CPU runners: n_threads=2, n_ctx=40960 (limits state size to ~60MB)
+        # Optimize context and quantization specs
         _llm_instance = Llama(
             model_path=str(model_path),
             n_threads=2,
@@ -72,16 +76,15 @@ def get_llm() -> Llama:
         )
     return _llm_instance
 
-
 def save_state_bg(state_file: Path, state_obj: Any, tokens: list) -> None:
     try:
         tmp_file = state_file.with_suffix(f".{threading.get_ident()}.tmp")
         with open(tmp_file, "wb") as sf:
             pickle.dump({"state": state_obj, "tokens": tokens}, sf)
         os.replace(tmp_file, state_file)
-        print(f"[Model] Background state saved to {state_file.name}", flush=True)
+        log_message("system", f"Background state saved to {state_file.name}")
     except Exception as e:
-        print(f"[Model] Background state save warning: {e}", flush=True)
+        log_message("system", f"Background state save warning: {e}")
 
 async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_number: Optional[str] = None, image_base64: Optional[str] = None) -> str:
     async with _llm_lock:
@@ -90,15 +93,21 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
             try:
                 llm: Llama = get_llm()
                 
+                # Vision mode handling
                 if image_base64 and getattr(llm, "chat_handler", None) is not None:
-                    print(f"[Model] Running vision query with image of size {len(image_base64)} characters", flush=True)
+                    log_message("system", f"Running vision query with image of size {len(image_base64)} characters")
                     if not image_base64.startswith("data:image"):
                         image_base64 = f"data:image/jpeg;base64,{image_base64}"
                     
                     logit_bias = {}
                     try:
+                        # Ban thought and thinking tokens
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
                         logit_bias[thought_token_id] = -100.0
+                        think_id = llm.tokenize(b"<think>")[-1]
+                        end_think_id = llm.tokenize(b"</think>")[-1]
+                        logit_bias[think_id] = -100.0
+                        logit_bias[end_think_id] = -100.0
                     except Exception:
                         pass
 
@@ -117,22 +126,21 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         logit_bias=logit_bias
                     )
                     text_chunks = []
-                    print("[Model Vision] Generating: ", end="", flush=True)
                     for chunk in response_generator:
                         delta = chunk["choices"][0]["delta"]
                         if "content" in delta:
                             token_text = delta["content"]
-                            print(token_text, end="", flush=True)
                             text_chunks.append(token_text)
-                    print("\n[Model Vision] Generation complete.", flush=True)
                     text_result = "".join(text_chunks)
+                    log_message("response", text_result)
                 else:
                     if image_base64:
-                        print(f"[Model] Text fallback mode: Received image of size {len(image_base64)} characters", flush=True)
+                        log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
                         prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
                     
-                    formatted_prompt: str = format_chat_prompt(prompt)
-                    new_tokens = llm.tokenize(formatted_prompt.encode("utf-8"))
+                    # Formulate query suffix in ChatML format
+                    query_suffix: str = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    new_tokens = llm.tokenize(query_suffix.encode("utf-8"))
                     
                     # Ensure dynamic folders exist
                     global_cache_dir = Path("global_cache")
@@ -141,62 +149,111 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     # 1. Load Client Global Cache first (pre-compiled prefix)
                     global_cache_file = global_cache_dir / f"{client_id}.bin" if client_id else None
                     loaded_global = False
+                    prefix_tokens = []
                     
                     if global_cache_file and global_cache_file.exists():
                         try:
-                            print(f"[Model] Restoring client global cache: {global_cache_file.name}", flush=True)
+                            log_message("system", f"Restoring client global cache: {global_cache_file.name}")
                             with open(global_cache_file, "rb") as f:
-                                global_state = pickle.load(f)
-                            llm.load_state(global_state)
+                                payload_obj = pickle.load(f)
+                            
+                            if isinstance(payload_obj, dict) and "state" in payload_obj:
+                                llm.load_state(payload_obj["state"])
+                                prefix_tokens = payload_obj.get("tokens", [])
+                            else:
+                                llm.load_state(payload_obj)
+                                prefix_tokens = []
+                                
                             loaded_global = True
                         except Exception as e:
-                            print(f"[Model] Warning: Failed to load global cache: {e}", flush=True)
+                            log_message("system", f"Warning: Failed to load global cache: {e}")
                             llm.reset()
                     else:
                         llm.reset()
-                        print("[Model] No client global cache found, running from scratch.", flush=True)
+                        log_message("system", "No client global cache found, running from scratch.")
                     
                     # 2. Load User Convo History cache on top of the global prefix
                     convo_file = STATES_DIR / f"{phone_number}.bin" if phone_number else None
+                    convo_tokens = []
                     if convo_file and convo_file.exists() and loaded_global:
                         try:
-                            print(f"[Model] Stapling conversation history: {convo_file.name}", flush=True)
+                            log_message("system", f"Stapling conversation history: {convo_file.name}")
                             with open(convo_file, "rb") as f:
-                                convo_state = pickle.load(f)
-                            llm.load_state(convo_state)
+                                convo_data = pickle.load(f)
+                                
+                            if isinstance(convo_data, dict) and "state" in convo_data:
+                                llm.load_state(convo_data["state"])
+                                convo_tokens = convo_data.get("tokens", [])
+                            else:
+                                llm.load_state(convo_data)
+                                convo_tokens = []
                         except Exception as e:
-                            print(f"[Model] Warning: Failed to restore conversation history: {e}", flush=True)
+                            log_message("system", f"Warning: Failed to restore conversation history: {e}")
                     
-                    # Apply logit_bias to ban <|channel>thought token generation
+                    # Target token list evaluated so far
+                    evaluated_tokens = convo_tokens if len(convo_tokens) > 0 else prefix_tokens
+                    
+                    # Append new prompt query suffix tokens
+                    full_token_sequence = evaluated_tokens + new_tokens
+                    
+                    if len(evaluated_tokens) > 0:
+                        # Context matches, append ONLY query tokens dynamically without re-processing
+                        llm.n_tokens = len(evaluated_tokens)
+                        tokens_to_eval = new_tokens
+                        log_message("system", f"Slicing cache: Skipping first {len(evaluated_tokens)} prefix tokens. Evaluating remaining {len(tokens_to_eval)} suffix tokens.")
+                    else:
+                        tokens_to_eval = full_token_sequence
+                        llm.reset()
+                        log_message("system", f"Cache mismatch or fresh run. Evaluating all {len(tokens_to_eval)} tokens.")
+
+                    # Apply logit_bias to ban <|channel>thought and <think>/</think> Qwen tokens
                     logit_bias = {}
                     try:
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
                         logit_bias[thought_token_id] = -100.0
+                        
+                        think_id = llm.tokenize(b"<think>")[-1]
+                        end_think_id = llm.tokenize(b"</think>")[-1]
+                        logit_bias[think_id] = -100.0
+                        logit_bias[end_think_id] = -100.0
                     except Exception:
                         pass
 
-                    response_generator = llm(
-                        formatted_prompt,
-                        max_tokens=512,
-                        stream=True,
+                    # Evaluate query tokens
+                    llm.eval(tokens_to_eval)
+                    
+                    # Generate response tokens step-by-step
+                    generator = llm.generate(
+                        full_token_sequence,
+                        temp=0.7,
+                        top_k=40,
+                        top_p=0.9,
                         logit_bias=logit_bias
                     )
                     
                     text_result_chunks = []
-                    print("[Model] Generating: ", end="", flush=True)
-                    for chunk in response_generator:
-                        token_text = chunk["choices"][0]["text"]
-                        print(token_text, end="", flush=True)
+                    for token in generator:
+                        if token == llm.token_eos():
+                            break
+                        token_text = llm.detokenize([token]).decode("utf-8", errors="ignore")
+                        
+                        # Stop if model outputs thinking tokens anyway
+                        if "<think>" in token_text:
+                            continue
+                        
                         text_result_chunks.append(token_text)
-                    print("\n[Model] Generation complete.", flush=True)
+                        
+                        if len(text_result_chunks) >= 512:
+                            break
+                            
                     text_result = "".join(text_result_chunks)
+                    log_message("response", text_result)
                     
-                    # 3. Save updated conversation state (containing new query + reply)
+                    # 3. Save updated conversation state
                     if phone_number:
                         try:
                             state_obj = llm.save_state()
-                            full_evaluated_text = formatted_prompt + text_result
-                            full_tokens = llm.tokenize(full_evaluated_text.encode("utf-8"))
+                            full_tokens = full_token_sequence + llm.tokenize(text_result.encode("utf-8"))
                             
                             t = threading.Thread(
                                 target=save_state_bg,
@@ -205,7 +262,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             )
                             t.start()
                         except Exception as save_err:
-                            print(f"[Model] Warning: Failed to save updated state: {save_err}", flush=True)
+                            log_message("system", f"Warning: Failed to save updated state: {save_err}")
                     
                 return text_result
             except Exception as e:
