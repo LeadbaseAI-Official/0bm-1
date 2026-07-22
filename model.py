@@ -178,10 +178,9 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     system_prompt, persona, kb = "", "", ""
                     if loaded_global and prefix_tokens:
                         try:
-                            system_text = llm.detokenize(prefix_tokens).decode("utf-8", errors="ignore")
-                            parts = system_text.split("Persona:")
+                            system_prompt = llm.detokenize(prefix_tokens).decode("utf-8", errors="ignore")
+                            parts = system_prompt.split("Persona:")
                             if len(parts) > 1:
-                                system_prompt = parts[0].replace("<|im_start|>system", "").replace("System Prompt:", "").strip()
                                 kb_parts = parts[1].split("Knowledge Base (Authoritative Facts):")
                                 if len(kb_parts) > 1:
                                     persona = kb_parts[0].strip()
@@ -287,7 +286,8 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         temperature=0.7,
                         top_k=40,
                         top_p=0.9,
-                        logit_bias=logit_bias
+                        logit_bias=logit_bias,
+                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
                     )
                     
                     text_result_chunks = []
@@ -298,6 +298,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         text_result_chunks.append(token_text)
                         
                     text_result = "".join(text_result_chunks)
+                    for stop_token in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
+                        if stop_token in text_result:
+                            text_result = text_result.split(stop_token)[0]
+                    text_result = text_result.strip()
                     log_message("response", text_result)
                     
                     # 4. Save updated conversation state
@@ -319,7 +323,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 "msg_count": msg_count
                             }
                             
-                            # Check if msg_count reaches 100 messages total (50 user queries)
+                            # Check if msg_count reaches MAX_HISTORY
                             if msg_count >= MAX_HISTORY:
                                 log_message("system", f"History for {phone_number} reached {msg_count} messages. Triggering KV worker summarization...")
                                 try:
