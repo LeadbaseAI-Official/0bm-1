@@ -300,7 +300,7 @@ def lru_eviction_check() -> None:
         
         try:
             # 1. Gather all local session cache files
-            state_files = list(STATES_DIR.glob("*.bin"))
+            state_files = list(STATES_DIR.glob("*_phone.bin"))
             state_files.sort(key=lambda x: x.stat().st_mtime) # Sort by oldest modification time
             
             # Fetch active redis-worker URL
@@ -316,6 +316,8 @@ def lru_eviction_check() -> None:
                 age_seconds = now - path.stat().st_mtime
                 if age_seconds > 1800:
                     phone_num = path.stem
+                    if phone_num.endswith("_phone"):
+                        phone_num = phone_num[:-6]
                     log_message("system", f"Evicting idle conversation state for {phone_num} (Age: {age_seconds / 60:.1f} minutes)...")
                     
                     if redis_url:
@@ -340,7 +342,7 @@ def lru_eviction_check() -> None:
                                     dns_data = res_dns.json()
                                     frontend_url = dns_data.get("frontend", {}).get("active") or "http://localhost:3000"
                                     requests.post(f"{frontend_url.rstrip('/')}/api/autoreply/routing/evict", json={"phone_number": phone_num}, timeout=5)
-                                except Exception as f_err:
+                                  except Exception as f_err:
                                     log_message("system", f"Failed to notify frontend eviction for {phone_num}: {f_err}")
                             else:
                                 log_message("system", f"Failed to evict {phone_num} to Redis (Returned {res.status_code})")
@@ -359,6 +361,8 @@ def lru_eviction_check() -> None:
                 for i in range(over_limit_count):
                     path = active_sessions[i]
                     phone_num = path.stem
+                    if phone_num.endswith("_phone"):
+                        phone_num = phone_num[:-6]
                     log_message("system", f"Forcing eviction of least recently used active session: {phone_num}")
                     
                     if redis_url:
@@ -376,7 +380,7 @@ def lru_eviction_check() -> None:
                             res = requests.post(f"{redis_url.rstrip('/')}/add", json=payload, timeout=20)
                             if res.status_code == 200:
                                 path.unlink()
-                                log_message("system", f"Forced eviction success: unlinked local {phone_num}.bin")
+                                log_message("system", f"Forced eviction success: unlinked local {phone_num}_phone.bin")
                                 
                                 # Notify frontend to clear JID sticky route
                                 try:
