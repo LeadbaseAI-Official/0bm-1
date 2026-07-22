@@ -249,8 +249,8 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             llm.reset()
                             log_message("system", "No client global cache or conversation history, running from scratch.")
                     
-                    # 3. Format prompt turn in ChatML layout
-                    new_turn_text = f"\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    # 3. Format prompt turn in ChatML layout with think pre-fill
+                    new_turn_text = f"\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                     new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
                     
                     # Determine target token list evaluated so far in the cache
@@ -293,15 +293,15 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     text_result_chunks = []
                     for chunk in completion_generator:
                         token_text = chunk["choices"][0]["text"]
-                        if "<think>" in token_text:
-                            continue
                         text_result_chunks.append(token_text)
                         
-                    text_result = "".join(text_result_chunks)
+                    raw_text = "".join(text_result_chunks)
+                    import re
+                    cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text)
                     for stop_token in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
-                        if stop_token in text_result:
-                            text_result = text_result.split(stop_token)[0]
-                    text_result = text_result.strip()
+                        if stop_token in cleaned_text:
+                            cleaned_text = cleaned_text.split(stop_token)[0]
+                    text_result = cleaned_text.strip()
                     log_message("response", text_result)
                     
                     # 4. Save updated conversation state
