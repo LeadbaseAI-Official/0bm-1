@@ -342,7 +342,7 @@ def lru_eviction_check() -> None:
                                     dns_data = res_dns.json()
                                     frontend_url = dns_data.get("frontend", {}).get("active") or "http://localhost:3000"
                                     requests.post(f"{frontend_url.rstrip('/')}/api/autoreply/routing/evict", json={"phone_number": phone_num}, timeout=5)
-                                  except Exception as f_err:
+                                except Exception as f_err:
                                     log_message("system", f"Failed to notify frontend eviction for {phone_num}: {f_err}")
                             else:
                                 log_message("system", f"Failed to evict {phone_num} to Redis (Returned {res.status_code})")
