@@ -18,12 +18,14 @@ _llm_instance: Optional[Llama] = None
 _states: Dict[str, Any] = {}
 
 MODEL_CODE = "0bm"
+MAX_HISTORY = 4
 
 # Standardized logging helper: [HH:MM:SS | DD] [tag] : msg
 def log_message(tag: str, msg: str) -> None:
-    now = datetime.datetime.now()
-    now_str = now.strftime("%H:%M:%S")
-    day_str = now.strftime("%d")
+    from datetime import datetime as dt, timezone, timedelta
+    ist_now = dt.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    now_str = ist_now.strftime("%H:%M:%S")
+    day_str = ist_now.strftime("%d")
     print(f"[{now_str} | {day_str}] [{tag}] : {msg}", flush=True)
 
 def find_gguf_file() -> Path:
@@ -77,17 +79,18 @@ def get_llm() -> Llama:
         )
     return _llm_instance
 
-def save_state_bg(state_file: Path, state_obj: Any, tokens: list) -> None:
+def save_state_bg(state_file: Path, customer_obj: dict) -> None:
     try:
         tmp_file = state_file.with_suffix(f".{threading.get_ident()}.tmp")
         with open(tmp_file, "wb") as sf:
-            pickle.dump({"state": state_obj, "tokens": tokens}, sf)
+            pickle.dump(customer_obj, sf)
         os.replace(tmp_file, state_file)
         log_message("system", f"Background state saved to {state_file.name}")
     except Exception as e:
         log_message("system", f"Background state save warning: {e}")
 
 async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_number: Optional[str] = None, image_base64: Optional[str] = None) -> str:
+    import base64
     async with _llm_lock:
         def evaluate_query() -> str:
             nonlocal prompt, image_base64
@@ -134,30 +137,25 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             text_chunks.append(token_text)
                     text_result = "".join(text_chunks)
                     log_message("response", text_result)
+                    return text_result
                 else:
                     if image_base64:
                         log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
                         prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
-                    
-                    # Split prompt into System Prefix config and Conversation Suffix
-                    split_marker = "Conversation History:"
-                    if split_marker in prompt:
-                        parts = prompt.split(split_marker, 1)
-                        first_part = parts[0]
-                        second_part = split_marker + parts[1]
-                        # Stitch matching ChatML template sequence
-                        formatted_prompt = f"<|im_start|>system\n{first_part.strip()}\n<|im_end|>\n<|im_start|>user\n{second_part.strip()}"
-                    else:
-                        formatted_prompt = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
                     
                     # Ensure dynamic folders exist
                     global_cache_dir = Path("global_cache")
                     global_cache_dir.mkdir(exist_ok=True)
                     
                     # 1. Load Client Global Cache first (pre-compiled prefix)
-                    global_cache_file = global_cache_dir / f"{client_id}.bin" if client_id else None
+                    # Support clientid_global.bin as priority, fallback to client_id.bin
+                    global_cache_file = global_cache_dir / f"{client_id}_global.bin" if client_id else None
+                    if global_cache_file and not global_cache_file.exists():
+                        global_cache_file = global_cache_dir / f"{client_id}.bin"
+                    
                     loaded_global = False
                     prefix_tokens = []
+                    global_cache_state = None
                     
                     if global_cache_file and global_cache_file.exists():
                         try:
@@ -166,29 +164,44 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 payload_obj = pickle.load(f)
                             
                             if isinstance(payload_obj, dict) and "state" in payload_obj:
-                                llm.load_state(payload_obj["state"])
+                                global_cache_state = payload_obj["state"]
                                 prefix_tokens = payload_obj.get("tokens", [])
                             else:
-                                llm.load_state(payload_obj)
+                                global_cache_state = payload_obj
                                 prefix_tokens = []
                                 
                             loaded_global = True
                         except Exception as e:
                             log_message("system", f"Warning: Failed to load global cache: {e}")
-                            llm.reset()
-                    else:
-                        llm.reset()
-                        log_message("system", "No client global cache found, running from scratch.")
                     
-                    # 2. Load User Convo History cache on top of the global prefix
-                    convo_file = STATES_DIR / f"{phone_number}.bin" if phone_number else None
+                    # Extract system prompt, persona, and KB from global cache
+                    system_prompt, persona, kb = "", "", ""
+                    if loaded_global and prefix_tokens:
+                        try:
+                            system_text = llm.detokenize(prefix_tokens).decode("utf-8", errors="ignore")
+                            parts = system_text.split("Persona:")
+                            if len(parts) > 1:
+                                system_prompt = parts[0].replace("<|im_start|>system", "").replace("System Prompt:", "").strip()
+                                kb_parts = parts[1].split("Knowledge Base (Authoritative Facts):")
+                                if len(kb_parts) > 1:
+                                    persona = kb_parts[0].strip()
+                                    kb = kb_parts[1].replace("<|im_end|>", "").strip()
+                                else:
+                                    persona = parts[1].replace("<|im_end|>", "").strip()
+                        except Exception as parse_err:
+                            log_message("system", f"Warning: Failed to parse system text: {parse_err}")
+
+                    # 2. Load User Convo History cache from phonenumber_phone.bin
+                    convo_file = STATES_DIR / f"{phone_number}_phone.bin" if phone_number else None
                     convo_tokens = []
+                    history = []
+                    msg_count = 0
+                    loaded_convo = False
                     
                     # On-demand state restoration if missing locally
                     if convo_file and not convo_file.exists() and phone_number and loaded_global:
                         org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
                         try:
-                            # Resolve active redis-worker URL
                             res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
                             if res_dns.status_code == 200:
                                 redis_url = res_dns.json().get("redis-worker", {}).get("active")
@@ -207,55 +220,54 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         except Exception as redis_err:
                             log_message("system", f"Warning: Failed to fetch state for {phone_number} from Redis: {redis_err}")
 
-                    if convo_file and convo_file.exists() and loaded_global:
+                    if convo_file and convo_file.exists():
                         try:
-                            log_message("system", f"Stapling conversation history: {convo_file.name}")
+                            log_message("system", f"Loading conversation history object: {convo_file.name}")
                             with open(convo_file, "rb") as f:
-                                convo_data = pickle.load(f)
+                                customer_obj = pickle.load(f)
                                 
-                            if isinstance(convo_data, dict) and "state" in convo_data:
-                                llm.load_state(convo_data["state"])
-                                convo_tokens = convo_data.get("tokens", [])
+                            if isinstance(customer_obj, dict) and "state" in customer_obj:
+                                llm.load_state(customer_obj["state"])
+                                convo_tokens = customer_obj.get("tokens", [])
+                                history = customer_obj.get("history", [])
+                                msg_count = customer_obj.get("msg_count", 0)
+                                loaded_convo = True
                             else:
-                                llm.load_state(convo_data)
+                                # Fallback or migration from old payload formats
+                                llm.load_state(customer_obj)
                                 convo_tokens = []
+                                history = []
+                                msg_count = 0
+                                loaded_convo = True
                         except Exception as e:
                             log_message("system", f"Warning: Failed to restore conversation history: {e}")
                     
-                    # Log the exact details of the incoming request and the loaded cache
-                    log_message("system", f"=== RAW PROMPT RECEIVED FROM REQUEST ===\n{prompt}\n========================================")
+                    if not loaded_convo:
+                        if loaded_global and global_cache_state:
+                            llm.load_state(global_cache_state)
+                            log_message("system", f"New user context: Initialized with {global_cache_file.name}")
+                        else:
+                            llm.reset()
+                            log_message("system", "No client global cache or conversation history, running from scratch.")
                     
-                    # Detokenize prefix_tokens to print the exact text of the loaded system cache
-                    prefix_text = ""
-                    if prefix_tokens:
-                        try:
-                            prefix_text = llm.detokenize(prefix_tokens).decode("utf-8", errors="ignore")
-                        except Exception:
-                            pass
-                    log_message("system", f"=== SYSTEM CACHE PREFIX TEXT ===\n{prefix_text}\n================================")
-
-                    # Tokenize the complete prompt sent by the frontend
-                    all_tokens = llm.tokenize(formatted_prompt.encode("utf-8"))
+                    # 3. Format prompt turn in ChatML layout
+                    new_turn_text = f"\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
                     
-                    # Target token list evaluated so far in the cache
-                    evaluated_tokens = convo_tokens if len(convo_tokens) > 0 else prefix_tokens
-                    
-                    # Find exact match length between current prompt tokens and cached tokens
-                    match_len = 0
-                    for t1, t2 in zip(all_tokens, evaluated_tokens):
-                        if t1 != t2:
-                            break
-                        match_len += 1
+                    # Determine target token list evaluated so far in the cache
+                    evaluated_tokens = convo_tokens if loaded_convo else prefix_tokens
+                    all_tokens = evaluated_tokens + new_turn_tokens
                     
                     # Set current evaluation index inside the context cache
-                    if match_len > 0:
+                    match_len = len(evaluated_tokens)
+                    if match_len > 0 and all_tokens[:match_len] == evaluated_tokens:
                         llm.n_tokens = match_len
-                        log_message("system", f"Recycling KV cache: Preserving {match_len} prefix tokens. Appending {len(all_tokens) - match_len} suffix tokens.")
+                        log_message("system", f"Recycling KV cache: Preserving {match_len} prefix tokens. Appending {len(new_turn_tokens)} suffix tokens.")
                     else:
                         llm.reset()
                         log_message("system", f"Fresh context run: Evaluating all {len(all_tokens)} tokens.")
 
-                    # Apply logit_bias to ban <|channel>thought and <think>/</think> Qwen reasoning tokens
+                    # Apply logit_bias to ban thought tokens
                     logit_bias = {}
                     try:
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
@@ -268,7 +280,6 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     except Exception:
                         pass
 
-                    # Stream completion utilizing full token array directly to preserve cache mapping
                     completion_generator = llm.create_completion(
                         prompt=all_tokens,
                         max_tokens=512,
@@ -282,7 +293,6 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     text_result_chunks = []
                     for chunk in completion_generator:
                         token_text = chunk["choices"][0]["text"]
-                        # Filter out reasoning tokens if they bypass logit_bias
                         if "<think>" in token_text:
                             continue
                         text_result_chunks.append(token_text)
@@ -290,22 +300,89 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     text_result = "".join(text_result_chunks)
                     log_message("response", text_result)
                     
-                    # 3. Save updated conversation state
+                    # 4. Save updated conversation state
                     if phone_number:
                         try:
+                            # Append user prompt and assistant response to text history
+                            history.append({"role": "user", "content": prompt})
+                            history.append({"role": "assistant", "content": text_result})
+                            msg_count += 2
+                            
                             state_obj = llm.save_state()
-                            full_tokens = full_token_sequence + llm.tokenize(text_result.encode("utf-8"))
+                            full_tokens = all_tokens + llm.tokenize(text_result.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
+                            
+                            customer_obj = {
+                                "phone_number": phone_number,
+                                "state": state_obj,
+                                "tokens": full_tokens,
+                                "history": history,
+                                "msg_count": msg_count
+                            }
+                            
+                            # Check if msg_count reaches 100 messages total (50 user queries)
+                            if msg_count >= MAX_HISTORY:
+                                log_message("system", f"History for {phone_number} reached {msg_count} messages. Triggering KV worker summarization...")
+                                try:
+                                    org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
+                                    res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
+                                    kv_url = None
+                                    if res_dns.status_code == 200:
+                                        dns_data = res_dns.json()
+                                        kv_workers_dict = dns_data.get("kv-worker", {})
+                                        if kv_workers_dict:
+                                            for name, url in kv_workers_dict.items():
+                                                if url:
+                                                    kv_url = url
+                                                    break
+                                    
+                                    if kv_url:
+                                        payload = {
+                                            "client_id": client_id,
+                                            "phone_number": phone_number,
+                                            "history": history,
+                                            "system_prompt": system_prompt,
+                                            "persona": persona,
+                                            "kb": kb
+                                        }
+                                        log_message("system", f"Sending /summarize request to {kv_url} for client {client_id}")
+                                        res_sum = requests.post(f"{kv_url.rstrip('/')}/summarize", json=payload, timeout=30)
+                                        if res_sum.status_code == 200:
+                                            res_data = res_sum.json()
+                                            if res_data.get("status") == "success":
+                                                state_bytes_b64 = res_data.get("state_bytes_base64")
+                                                if state_bytes_b64:
+                                                    state_bytes = base64.b64decode(state_bytes_b64)
+                                                    payload_obj = pickle.loads(state_bytes)
+                                                    
+                                                    customer_obj = {
+                                                        "phone_number": phone_number,
+                                                        "state": payload_obj["state"],
+                                                        "tokens": payload_obj["tokens"],
+                                                        "history": [],
+                                                        "msg_count": 0
+                                                    }
+                                                    log_message("system", f"Successfully summarized conversation. New summary: {res_data.get('summary')}")
+                                                else:
+                                                    log_message("system", "Warning: /summarize returned success but empty state_bytes_base64")
+                                            else:
+                                                log_message("system", f"Warning: /summarize failed: {res_data.get('detail')}")
+                                        else:
+                                            log_message("system", f"Warning: /summarize returned status {res_sum.status_code}")
+                                    else:
+                                        log_message("system", "Warning: No active KV worker found in DNS to perform summarization.")
+                                except Exception as sum_err:
+                                    log_message("system", f"Warning: Summarization error: {sum_err}")
                             
                             t = threading.Thread(
                                 target=save_state_bg,
-                                args=(convo_file, state_obj, full_tokens),
+                                args=(convo_file, customer_obj),
                                 daemon=True
                             )
                             t.start()
                         except Exception as save_err:
                             log_message("system", f"Warning: Failed to save updated state: {save_err}")
                     
-                return text_result
+                    return text_result
             except Exception as e:
                 import traceback
                 traceback.print_exc()
