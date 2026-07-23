@@ -261,11 +261,16 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 convo_tokens = []
                                 log_message("system", "No client global cache or conversation history, running from scratch.")
 
-                    # Pass incremental turn tokens when KV state is loaded
-                    if llm.n_tokens > 0:
-                        prompt_to_evaluate = new_turn_tokens
+                    # Determine target token list evaluated so far in the cache
+                    evaluated_tokens = convo_tokens if (loaded_convo or (phone_number and phone_number in _ram_states_cache)) else prefix_tokens
+                    all_tokens = evaluated_tokens + new_turn_tokens
+                    
+                    # Set n_tokens to evaluated_tokens length so llama.cpp matches 100% prefix in KV cache
+                    llm.n_tokens = len(evaluated_tokens)
+                    if len(evaluated_tokens) > 0:
+                        log_message("system", f"Recycling KV cache: Preserving {len(evaluated_tokens)} prefix tokens. Appending {len(new_turn_tokens)} suffix tokens.")
                     else:
-                        prompt_to_evaluate = convo_tokens + new_turn_tokens
+                        log_message("system", f"Fresh context run: Evaluating all {len(all_tokens)} tokens.")
 
                     # Apply logit_bias to ban thought tokens and suppress <stop> token
                     logit_bias = {}
@@ -285,7 +290,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         pass
 
                     completion_generator = llm.create_completion(
-                        prompt=prompt_to_evaluate,
+                        prompt=all_tokens,
                         max_tokens=512,
                         stream=True,
                         temperature=0.7,
@@ -335,7 +340,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             msg_count += 2
                             
                             state_obj = llm.save_state()
-                            full_tokens = convo_tokens + new_turn_tokens + llm.tokenize(text_result.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
+                            full_tokens = all_tokens
                             
                             customer_obj = {
                                 "phone_number": phone_number,
