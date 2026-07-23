@@ -89,6 +89,114 @@ def save_state_bg(state_file: Path, customer_obj: dict) -> None:
     except Exception as e:
         log_message("system", f"Background state save warning: {e}")
 
+def run_summarization_bg(client_id: str, phone_number: str, history: list, system_prompt: str, persona: str, kb: str, convo_file: Path) -> None:
+    import base64
+    log_message("system", f"Starting background summarization for {phone_number}...")
+    try:
+        org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
+        res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
+        kv_url = None
+        if res_dns.status_code == 200:
+            dns_data = res_dns.json()
+            kv_workers_dict = dns_data.get("kv-worker", {})
+            if kv_workers_dict:
+                for name, url in kv_workers_dict.items():
+                    if url:
+                        kv_url = url
+                        break
+        
+        if kv_url:
+            payload = {
+                "client_id": client_id,
+                "phone_number": phone_number,
+                "history": history,
+                "system_prompt": system_prompt,
+                "persona": persona,
+                "kb": kb
+            }
+            log_message("system", f"Sending background /summarize request to {kv_url} for client {client_id}")
+            res_sum = requests.post(f"{kv_url.rstrip('/')}/summarize", json=payload, timeout=600)
+            if res_sum.status_code == 200:
+                res_data = res_sum.json()
+                if res_data.get("status") == "success":
+                    state_bytes_b64 = res_data.get("state_bytes_base64")
+                    if state_bytes_b64:
+                        state_bytes = base64.b64decode(state_bytes_b64)
+                        payload_obj = pickle.loads(state_bytes)
+                        
+                        # Load any new messages that arrived while we were summarizing
+                        new_messages = []
+                        if convo_file.exists():
+                            try:
+                                with open(convo_file, "rb") as f:
+                                    current_obj = pickle.load(f)
+                                if isinstance(current_obj, dict):
+                                    current_history = current_obj.get("history", [])
+                                    if len(current_history) > len(history):
+                                        new_messages = current_history[len(history):]
+                                        log_message("system", f"Detected {len(new_messages)} new messages sent during summarization. Merging...")
+                            except Exception as read_err:
+                                log_message("system", f"Warning: Failed to read convo file for merge: {read_err}")
+                        
+                        summary_state = payload_obj["state"]
+                        summary_tokens = payload_obj["tokens"]
+                        
+                        if new_messages:
+                            async def eval_new_messages_on_summary() -> tuple[Any, list[int]]:
+                                async with _llm_lock:
+                                    llm = get_llm()
+                                    llm.load_state(summary_state)
+                                    llm.n_tokens = len(summary_tokens)
+                                    
+                                    merged_tokens = list(summary_tokens)
+                                    for msg in new_messages:
+                                        role = msg.get("role", "user")
+                                        content = msg.get("content", "")
+                                        
+                                        if role == "user":
+                                            turn_text = f"\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+                                        else:
+                                            turn_text = f"{content}<|im_end|>\n"
+                                            
+                                        turn_tokens = llm.tokenize(turn_text.encode("utf-8"))
+                                        match_len = llm.n_tokens
+                                        for idx, tok in enumerate(turn_tokens):
+                                            llm.input_ids[match_len + idx] = tok
+                                            
+                                        llm.eval(turn_tokens)
+                                        merged_tokens.extend(turn_tokens)
+                                        
+                                    updated_state = llm.save_state()
+                                    return updated_state, merged_tokens
+                                    
+                            try:
+                                loop = asyncio.new_event_loop()
+                                summary_state, summary_tokens = loop.run_until_complete(eval_new_messages_on_summary())
+                                loop.close()
+                            except Exception as merge_err:
+                                log_message("system", f"Warning: Failed to merge new messages: {merge_err}")
+                        
+                        customer_obj = {
+                            "phone_number": phone_number,
+                            "state": summary_state,
+                            "tokens": summary_tokens,
+                            "history": new_messages,
+                            "msg_count": len(new_messages)
+                        }
+                        with open(convo_file, "wb") as sf:
+                            pickle.dump(customer_obj, sf)
+                        log_message("system", f"Background summarization complete for {phone_number}. State file updated and history reset.")
+                    else:
+                        log_message("system", f"Warning: /summarize success but empty state_bytes_base64 for {phone_number}")
+                else:
+                    log_message("system", f"Warning: /summarize failed: {res_data.get('detail')} for {phone_number}")
+            else:
+                log_message("system", f"Warning: /summarize status {res_sum.status_code} for {phone_number}")
+        else:
+            log_message("system", f"Warning: No active KV worker found to summarize history for {phone_number}")
+    except Exception as e:
+        log_message("system", f"Warning: Background summarization failed for {phone_number}: {e}")
+
 async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_number: Optional[str] = None, image_base64: Optional[str] = None) -> str:
     import base64
     async with _llm_lock:
@@ -348,66 +456,21 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 "msg_count": msg_count
                             }
                             
-                            # Check if msg_count reaches MAX_HISTORY
-                            if msg_count >= MAX_HISTORY:
-                                log_message("system", f"History for {phone_number} reached {msg_count} messages. Triggering KV worker summarization...")
-                                try:
-                                    org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
-                                    res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
-                                    kv_url = None
-                                    if res_dns.status_code == 200:
-                                        dns_data = res_dns.json()
-                                        kv_workers_dict = dns_data.get("kv-worker", {})
-                                        if kv_workers_dict:
-                                            for name, url in kv_workers_dict.items():
-                                                if url:
-                                                    kv_url = url
-                                                    break
-                                    
-                                    if kv_url:
-                                        payload = {
-                                            "client_id": client_id,
-                                            "phone_number": phone_number,
-                                            "history": history,
-                                            "system_prompt": system_prompt,
-                                            "persona": persona,
-                                            "kb": kb
-                                        }
-                                        log_message("system", f"Sending /summarize request to {kv_url} for client {client_id}")
-                                        res_sum = requests.post(f"{kv_url.rstrip('/')}/summarize", json=payload, timeout=30)
-                                        if res_sum.status_code == 200:
-                                            res_data = res_sum.json()
-                                            if res_data.get("status") == "success":
-                                                state_bytes_b64 = res_data.get("state_bytes_base64")
-                                                if state_bytes_b64:
-                                                    state_bytes = base64.b64decode(state_bytes_b64)
-                                                    payload_obj = pickle.loads(state_bytes)
-                                                    
-                                                    customer_obj = {
-                                                        "phone_number": phone_number,
-                                                        "state": payload_obj["state"],
-                                                        "tokens": payload_obj["tokens"],
-                                                        "history": [],
-                                                        "msg_count": 0
-                                                    }
-                                                    log_message("system", f"Successfully summarized conversation. New summary: {res_data.get('summary')}")
-                                                else:
-                                                    log_message("system", "Warning: /summarize returned success but empty state_bytes_base64")
-                                            else:
-                                                log_message("system", f"Warning: /summarize failed: {res_data.get('detail')}")
-                                        else:
-                                            log_message("system", f"Warning: /summarize returned status {res_sum.status_code}")
-                                    else:
-                                        log_message("system", "Warning: No active KV worker found in DNS to perform summarization.")
-                                except Exception as sum_err:
-                                    log_message("system", f"Warning: Summarization error: {sum_err}")
-                            
                             t = threading.Thread(
                                 target=save_state_bg,
                                 args=(convo_file, customer_obj),
                                 daemon=True
                             )
                             t.start()
+                            
+                            # Check if msg_count reaches MAX_HISTORY to run summarization in the background
+                            if msg_count >= MAX_HISTORY:
+                                sum_t = threading.Thread(
+                                    target=run_summarization_bg,
+                                    args=(client_id, phone_number, history, system_prompt, persona, kb, convo_file),
+                                    daemon=True
+                                )
+                                sum_t.start()
                         except Exception as save_err:
                             log_message("system", f"Warning: Failed to save updated state: {save_err}")
                     
