@@ -296,9 +296,37 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 log_message("system", f"Phone number {phone_number} reached MAX_HISTORY limit ({msg_count} msgs). Excluding in Redis...")
                                 try:
                                     org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
-                                    res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
-                                    if res_dns.status_code == 200:
-                                        redis_url = res_dns.json().get("redis-worker", {}).get("active")
+                                    pat: str = os.getenv("GITHUB_PAT", "")
+                                    headers = {
+                                        "User-Agent": "LeadBaseAI-Runner",
+                                        "Cache-Control": "no-cache, no-store, must-revalidate",
+                                        "Pragma": "no-cache"
+                                    }
+                                    if pat:
+                                        headers["Authorization"] = f"token {pat}"
+                                        
+                                    config_data = None
+                                    try:
+                                        api_url = f"https://api.github.com/repos/{org}/dns/contents/config.json"
+                                        res_api = requests.get(api_url, headers=headers, timeout=5)
+                                        if res_api.status_code == 200:
+                                            api_json = res_api.json()
+                                            if "content" in api_json:
+                                                import json
+                                                decoded = base64.b64decode(api_json["content"]).decode("utf-8")
+                                                config_data = json.loads(decoded)
+                                    except Exception:
+                                        pass
+                                        
+                                    if not config_data:
+                                        import time
+                                        timestamp = int(time.time())
+                                        res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json?t={timestamp}", headers=headers, timeout=5)
+                                        if res_dns.status_code == 200:
+                                            config_data = res_dns.json()
+
+                                    if config_data:
+                                        redis_url = config_data.get("redis-worker", {}).get("active")
                                         if redis_url:
                                             requests.post(
                                                 f"{redis_url.rstrip('/')}/add",
