@@ -109,10 +109,17 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
             with _eval_lock:
                 try:
                     llm: Llama = get_llm()
-                    log_message("system", f"Processing query for phone {phone_number} on single shared model weights...")
+                    log_message("debug", f"═══════════════════════════════════════════════════════════")
+                    log_message("debug", f"INCOMING REQUEST")
+                    log_message("debug", f"  phone_number  = {phone_number}")
+                    log_message("debug", f"  client_id     = {client_id}")
+                    log_message("debug", f"  prompt        = {repr(prompt[:100])}{'...' if len(prompt) > 100 else ''}")
+                    log_message("debug", f"  image_base64  = {'YES (' + str(len(image_base64)) + ' chars)' if image_base64 else 'None'}")
+                    log_message("debug", f"  llm.n_tokens  = {llm.n_tokens} (before any load)")
+                    log_message("debug", f"  RAM cache     = {list(_ram_states_cache.keys())} ({len(_ram_states_cache)}/{RAM_CACHE_CAPACITY})")
+                    log_message("debug", f"═══════════════════════════════════════════════════════════")
                     
-                    # Vision mode handling: use create_chat_completion if vision handler is available,
-                    # otherwise fall back to text-only create_completion path.
+                    # Vision mode handling
                     if image_base64 and getattr(llm, "chat_handler", None) is not None:
                         log_message("system", f"Running vision query with image of size {len(image_base64)} characters")
                         if not image_base64.startswith("data:image"):
@@ -120,7 +127,6 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
 
                         logit_bias = {}
                         try:
-                            # Ban thought and thinking tokens
                             thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
                             logit_bias[thought_token_id] = -100.0
                             think_id = llm.tokenize(b"<think>")[-1]
@@ -158,22 +164,26 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
                             prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
 
-                    # Ensure dynamic folders exist
+                    # ─── STEP 1: Tokenize new user turn ───
                     global_cache_dir = Path("global_cache")
                     global_cache_dir.mkdir(exist_ok=True)
                     
                     new_turn_text = f"\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                     new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
+                    log_message("debug", f"STEP 1: Tokenized new turn")
+                    log_message("debug", f"  new_turn_text (first 80 chars) = {repr(new_turn_text[:80])}")
+                    log_message("debug", f"  new_turn_tokens count          = {len(new_turn_tokens)}")
+                    log_message("debug", f"  new_turn_tokens[:5]            = {new_turn_tokens[:5]}")
 
                     convo_file = STATES_DIR / f"{phone_number}_phone.bin" if phone_number else None
                     convo_tokens = []
                     history = []
                     msg_count = 0
                     loaded_convo = False
+                    load_source = "NONE"
 
-                    # 1. RAM LRU Cache check (Capacity: 5 active sessions in memory)
+                    # ─── STEP 2: Try RAM LRU Cache (Level-1) ───
                     if phone_number and phone_number in _ram_states_cache:
-                        log_message("system", f"RAM LRU Hit for {phone_number} ({len(_ram_states_cache)}/5 in RAM). Restoring state from RAM...")
                         ram_obj = _ram_states_cache[phone_number]
                         _ram_states_cache.move_to_end(phone_number)
                         llm.load_state(ram_obj["state"])
@@ -181,8 +191,19 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         msg_count = ram_obj.get("msg_count", 0)
                         convo_tokens = ram_obj.get("tokens", [])
                         loaded_convo = True
+                        load_source = "RAM_LRU"
+                        log_message("debug", f"STEP 2: RAM LRU HIT ✓")
+                        log_message("debug", f"  phone          = {phone_number}")
+                        log_message("debug", f"  convo_tokens   = {len(convo_tokens)} tokens loaded from RAM")
+                        log_message("debug", f"  history turns  = {len(history)} messages")
+                        log_message("debug", f"  msg_count      = {msg_count}")
+                        log_message("debug", f"  llm.n_tokens   = {llm.n_tokens} (after load_state)")
+                        log_message("debug", f"  tokens[:5]     = {convo_tokens[:5] if convo_tokens else '[]'}")
+                        log_message("debug", f"  tokens[-5:]    = {convo_tokens[-5:] if convo_tokens else '[]'}")
                     else:
-                        # 2. Load Client Global Cache first (pre-compiled prefix)
+                        log_message("debug", f"STEP 2: RAM LRU MISS ✗ for {phone_number}")
+                        
+                        # ─── STEP 3: Load Global Prefix Cache ───
                         global_cache_file = global_cache_dir / f"{client_id}_global.bin" if client_id else None
                         if global_cache_file and not global_cache_file.exists():
                             global_cache_file = global_cache_dir / f"{client_id}.bin"
@@ -193,7 +214,6 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         
                         if global_cache_file and global_cache_file.exists():
                             try:
-                                log_message("system", f"Restoring client global cache: {global_cache_file.name}")
                                 with open(global_cache_file, "rb") as f:
                                     payload_obj = pickle.load(f)
                                 
@@ -205,10 +225,16 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                     prefix_tokens = []
                                     
                                 loaded_global = True
+                                log_message("debug", f"STEP 3: Global prefix cache LOADED ✓")
+                                log_message("debug", f"  file           = {global_cache_file.name}")
+                                log_message("debug", f"  prefix_tokens  = {len(prefix_tokens)} tokens")
+                                log_message("debug", f"  prefix[:5]     = {prefix_tokens[:5] if prefix_tokens else '[]'}")
                             except Exception as e:
-                                log_message("system", f"Warning: Failed to load global cache: {e}")
+                                log_message("debug", f"STEP 3: Global prefix cache FAILED ✗: {e}")
+                        else:
+                            log_message("debug", f"STEP 3: Global prefix cache NOT FOUND ✗ (file={global_cache_file})")
                         
-                        # 3. Load User Convo History cache from phonenumber_phone.bin or Redis
+                        # ─── STEP 4: Try Redis hydration ───
                         if convo_file and not convo_file.exists() and phone_number and loaded_global:
                             org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
                             try:
@@ -216,7 +242,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 if res_dns.status_code == 200:
                                     redis_url = res_dns.json().get("redis-worker", {}).get("active")
                                     if redis_url:
-                                        log_message("system", f"Local convo cache missing. Querying active Redis for state:{phone_number}...")
+                                        log_message("debug", f"STEP 4: Querying Redis for state:{phone_number}...")
                                         res_redis = requests.get(f"{redis_url.rstrip('/')}/get?key=state:{phone_number}", timeout=10)
                                         if res_redis.status_code == 200:
                                             payload = res_redis.json().get("value", "")
@@ -226,13 +252,22 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                                 decompressed = gzip.decompress(compressed_bytes)
                                                 with open(convo_file, "wb") as f:
                                                     f.write(decompressed)
-                                                log_message("system", f"Successfully hydrated convo cache for {phone_number} from Redis.")
+                                                log_message("debug", f"STEP 4: Redis hydration SUCCESS ✓ ({len(decompressed)} bytes)")
+                                            else:
+                                                log_message("debug", f"STEP 4: Redis returned empty payload ✗")
+                                        else:
+                                            log_message("debug", f"STEP 4: Redis returned HTTP {res_redis.status_code} ✗")
+                                    else:
+                                        log_message("debug", f"STEP 4: No active redis-worker in DNS ✗")
                             except Exception as redis_err:
-                                log_message("system", f"Warning: Failed to fetch state for {phone_number} from Redis: {redis_err}")
+                                log_message("debug", f"STEP 4: Redis hydration FAILED ✗: {redis_err}")
+                        else:
+                            disk_exists = convo_file and convo_file.exists()
+                            log_message("debug", f"STEP 4: Redis skipped (disk_exists={disk_exists}, loaded_global={loaded_global if 'loaded_global' in dir() else 'N/A'})")
 
+                        # ─── STEP 5: Load Disk State (Level-2) ───
                         if convo_file and convo_file.exists():
                             try:
-                                log_message("system", f"Loading conversation history object: {convo_file.name}")
                                 with open(convo_file, "rb") as f:
                                     customer_obj = pickle.load(f)
                                     
@@ -242,53 +277,77 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                     history = customer_obj.get("history", [])
                                     msg_count = customer_obj.get("msg_count", 0)
                                     loaded_convo = True
+                                    load_source = "DISK"
                                 else:
                                     llm.load_state(customer_obj)
                                     convo_tokens = []
                                     history = []
                                     msg_count = 0
                                     loaded_convo = True
+                                    load_source = "DISK_LEGACY"
+                                log_message("debug", f"STEP 5: Disk state LOADED ✓ (source={load_source})")
+                                log_message("debug", f"  file           = {convo_file.name}")
+                                log_message("debug", f"  convo_tokens   = {len(convo_tokens)} tokens")
+                                log_message("debug", f"  history turns  = {len(history)} messages")
+                                log_message("debug", f"  msg_count      = {msg_count}")
+                                log_message("debug", f"  llm.n_tokens   = {llm.n_tokens} (after load_state)")
+                                log_message("debug", f"  tokens[:5]     = {convo_tokens[:5] if convo_tokens else '[]'}")
+                                log_message("debug", f"  tokens[-5:]    = {convo_tokens[-5:] if convo_tokens else '[]'}")
                             except Exception as e:
-                                log_message("system", f"Warning: Failed to restore conversation history: {e}")
+                                log_message("debug", f"STEP 5: Disk state FAILED ✗: {e}")
                         
                         if not loaded_convo:
                             if loaded_global and global_cache_state:
                                 llm.load_state(global_cache_state)
                                 convo_tokens = prefix_tokens
-                                log_message("system", f"New user context: Initialized with {global_cache_file.name}")
+                                load_source = "GLOBAL_PREFIX"
+                                log_message("debug", f"STEP 5: Initialized from global prefix (source={load_source})")
+                                log_message("debug", f"  convo_tokens   = {len(convo_tokens)} (= prefix_tokens)")
+                                log_message("debug", f"  llm.n_tokens   = {llm.n_tokens}")
                             else:
                                 llm.reset()
                                 convo_tokens = []
-                                log_message("system", "No client global cache or conversation history, running from scratch.")
+                                load_source = "SCRATCH"
+                                log_message("debug", f"STEP 5: Running from SCRATCH ✗ (no cache found)")
 
-                    # Determine target token list evaluated so far in the cache
-                    evaluated_tokens = convo_tokens if (loaded_convo or (phone_number and phone_number in _ram_states_cache)) else prefix_tokens
+                    # ─── STEP 6: Build all_tokens & set n_tokens for prefix matching ───
+                    evaluated_tokens = convo_tokens if (loaded_convo or (phone_number and phone_number in _ram_states_cache)) else (prefix_tokens if 'prefix_tokens' in dir() else [])
                     all_tokens = evaluated_tokens + new_turn_tokens
                     
-                    # Set n_tokens to evaluated_tokens length so llama.cpp matches 100% prefix in KV cache
+                    n_tokens_before_set = llm.n_tokens
                     llm.n_tokens = len(evaluated_tokens)
+                    
+                    log_message("debug", f"STEP 6: Token alignment for prefix matching")
+                    log_message("debug", f"  load_source         = {load_source}")
+                    log_message("debug", f"  evaluated_tokens    = {len(evaluated_tokens)}")
+                    log_message("debug", f"  new_turn_tokens     = {len(new_turn_tokens)}")
+                    log_message("debug", f"  all_tokens          = {len(all_tokens)} (= evaluated + new_turn)")
+                    log_message("debug", f"  llm.n_tokens BEFORE = {n_tokens_before_set}")
+                    log_message("debug", f"  llm.n_tokens SET TO = {llm.n_tokens}")
+                    log_message("debug", f"  MATCH EXPECTED      = {llm.n_tokens == len(evaluated_tokens)}")
                     if len(evaluated_tokens) > 0:
-                        log_message("system", f"Recycling KV cache: Preserving {len(evaluated_tokens)} prefix tokens. Appending {len(new_turn_tokens)} suffix tokens.")
-                    else:
-                        log_message("system", f"Fresh context run: Evaluating all {len(all_tokens)} tokens.")
+                        log_message("debug", f"  eval_tokens[:5]     = {evaluated_tokens[:5]}")
+                        log_message("debug", f"  eval_tokens[-5:]    = {evaluated_tokens[-5:]}")
+                        log_message("debug", f"  all_tokens[{len(evaluated_tokens)}:{len(evaluated_tokens)+5}] = {all_tokens[len(evaluated_tokens):len(evaluated_tokens)+5]}")
 
-                    # Apply logit_bias to ban thought tokens and suppress <stop> token
+                    # ─── STEP 7: Apply logit_bias ───
                     logit_bias = {}
                     try:
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
                         logit_bias[thought_token_id] = -100.0
-                        
                         think_id = llm.tokenize(b"<think>")[-1]
                         end_think_id = llm.tokenize(b"</think>")[-1]
                         logit_bias[think_id] = -100.0
                         logit_bias[end_think_id] = -100.0
-
-                        # Suppress <stop> token — we only use <abandon> now
                         stop_token_id = llm.tokenize(b"<stop>")[-1]
                         logit_bias[stop_token_id] = -100.0
                     except Exception:
                         pass
+                    log_message("debug", f"STEP 7: logit_bias = {len(logit_bias)} token(s) banned")
 
+                    # ─── STEP 8: Run create_completion with fallback alignment ───
+                    log_message("debug", f"STEP 8: Calling create_completion(prompt={len(all_tokens)} tokens, llm.n_tokens={llm.n_tokens})")
+                    fallback_used = False
                     try:
                         completion_generator = llm.create_completion(
                             prompt=all_tokens,
@@ -300,12 +359,18 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             logit_bias=logit_bias,
                             stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
                         )
+                        log_message("debug", f"STEP 8: create_completion returned generator OK ✓")
                     except Exception as eval_err:
-                        log_message("system", f"Fallback timeline alignment triggered: {eval_err}. Aligning to last matching prefix...")
+                        fallback_used = True
+                        log_message("debug", f"STEP 8: create_completion FAILED ✗: {eval_err}")
                         match_len = min(llm.n_tokens, len(evaluated_tokens))
                         llm.n_tokens = match_len
                         aligned_prompt = all_tokens[match_len:] if match_len > 0 else all_tokens
-                        log_message("system", f"Resuming evaluation from token index {match_len} ({len(aligned_prompt)} suffix tokens)...")
+                        log_message("debug", f"STEP 8 FALLBACK: Timeline alignment triggered")
+                        log_message("debug", f"  match_len        = {match_len}")
+                        log_message("debug", f"  llm.n_tokens     = {llm.n_tokens} (rewound)")
+                        log_message("debug", f"  aligned_prompt   = {len(aligned_prompt)} suffix tokens")
+                        log_message("debug", f"  aligned[:5]      = {aligned_prompt[:5]}")
                         completion_generator = llm.create_completion(
                             prompt=aligned_prompt,
                             max_tokens=512,
@@ -316,25 +381,25 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             logit_bias=logit_bias,
                             stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
                         )
+                        log_message("debug", f"STEP 8 FALLBACK: Retry create_completion OK ✓")
                     
+                    # ─── STEP 9: Stream generation ───
                     text_result_chunks = []
+                    gen_token_count = 0
                     for chunk in completion_generator:
                         token_text = chunk["choices"][0]["text"]
                         text_result_chunks.append(token_text)
+                        gen_token_count += 1
                         
                     raw_text = "".join(text_result_chunks)
                     import re
                     cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text)
-                    
-                    # Cut off text cleanly at any ChatML tag or variant (e.g. <|im_start|, <|im_end|, <|im_start|}, etc.)
                     cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', cleaned_text)[0]
                     
-                    # Extract <abandon> token before stripping it from visible reply
                     abandon_token: Optional[str] = None
                     abandon_match = re.search(r'<abandon>(.*?)</abandon>', cleaned_text, re.IGNORECASE | re.DOTALL)
                     if abandon_match:
                         abandon_token = abandon_match.group(1).strip()
-                    # Strip both <abandon> and legacy <stop> tags from the visible reply
                     cleaned_text = re.sub(r'<abandon>[\s\S]*?</abandon>', '', cleaned_text, flags=re.IGNORECASE)
                     cleaned_text = re.sub(r'<stop>[\s\S]*?</stop>', '', cleaned_text, flags=re.IGNORECASE)
                     text_result = cleaned_text.strip()
@@ -343,15 +408,21 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         greetings = ["hi", "hello", "good morning", "good afternoon", "good evening", "hey"]
                         lower_reply = text_result.lower()
                         if any(g in lower_reply for g in greetings) and len(text_result) < 150:
-                            log_message("system", f"Ignored false-positive abandon token '{abandon_token}' because response is a greeting.")
+                            log_message("debug", f"STEP 9: Ignored false-positive abandon '{abandon_token}' (greeting)")
                             abandon_token = None
-                            
+                    
+                    log_message("debug", f"STEP 9: Generation complete")
+                    log_message("debug", f"  gen_token_count  = {gen_token_count}")
+                    log_message("debug", f"  raw_text length  = {len(raw_text)} chars")
+                    log_message("debug", f"  text_result len  = {len(text_result)} chars")
+                    log_message("debug", f"  abandon_token    = {abandon_token}")
+                    log_message("debug", f"  fallback_used    = {fallback_used}")
+                    log_message("debug", f"  llm.n_tokens     = {llm.n_tokens} (after generation)")
                     log_message("response", f"{text_result}{' [ABANDON:' + abandon_token + ']' if abandon_token else ''}")
                     
-                    # 4. Save updated conversation state
+                    # ─── STEP 10: Save state ───
                     if phone_number:
                         try:
-                            # Append user prompt and assistant response to text history
                             history.append({"role": "user", "content": prompt})
                             history.append({"role": "assistant", "content": text_result})
                             msg_count += 2
@@ -368,12 +439,27 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 "msg_count": msg_count
                             }
                             
+                            log_message("debug", f"STEP 10: Saving state")
+                            log_message("debug", f"  all_tokens       = {len(all_tokens)} (prompt input)")
+                            log_message("debug", f"  response_tokens  = {len(response_tokens)} (generated output tokenized)")
+                            log_message("debug", f"  full_tokens      = {len(full_tokens)} (= all + response = SAVED)")
+                            log_message("debug", f"  full[:5]         = {full_tokens[:5]}")
+                            log_message("debug", f"  full[-5:]        = {full_tokens[-5:]}")
+                            log_message("debug", f"  state_obj size   = {len(state_obj) if hasattr(state_obj, '__len__') else 'N/A'}")
+                            log_message("debug", f"  history turns    = {len(history)} messages")
+                            log_message("debug", f"  msg_count        = {msg_count}")
+                            
                             # Cache active session in Level-1 RAM LRU cache (Capacity: 5)
                             _ram_states_cache[phone_number] = customer_obj
                             _ram_states_cache.move_to_end(phone_number)
+                            ram_evicted = None
                             if len(_ram_states_cache) > RAM_CACHE_CAPACITY:
-                                evicted_phone, _ = _ram_states_cache.popitem(last=False)
-                                log_message("system", f"RAM LRU limit reached (5). Evicted {evicted_phone} from RAM cache.")
+                                ram_evicted, _ = _ram_states_cache.popitem(last=False)
+                            
+                            log_message("debug", f"STEP 10: RAM LRU cache updated")
+                            log_message("debug", f"  RAM keys         = {list(_ram_states_cache.keys())}")
+                            log_message("debug", f"  RAM size         = {len(_ram_states_cache)}/{RAM_CACHE_CAPACITY}")
+                            log_message("debug", f"  RAM evicted      = {ram_evicted or 'None'}")
                             
                             t = threading.Thread(
                                 target=save_state_bg,
@@ -381,6 +467,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 daemon=True
                             )
                             t.start()
+                            log_message("debug", f"STEP 10: Disk save thread launched for {convo_file.name if convo_file else 'None'}")
                             
                             # Check if msg_count reaches MAX_HISTORY (200 messages) to exclude the number persistently
                             if msg_count >= MAX_HISTORY:
@@ -429,8 +516,16 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 except Exception as ex_err:
                                     log_message("system", f"Warning: Failed to publish excluded status to Redis: {ex_err}")
                         except Exception as save_err:
-                            log_message("system", f"Warning: Failed to save updated state: {save_err}")
+                            log_message("debug", f"STEP 10: SAVE FAILED ✗: {save_err}")
                     
+                    log_message("debug", f"═══════════════════════════════════════════════════════════")
+                    log_message("debug", f"REQUEST COMPLETE")
+                    log_message("debug", f"  phone        = {phone_number}")
+                    log_message("debug", f"  load_source  = {load_source}")
+                    log_message("debug", f"  fallback     = {fallback_used}")
+                    log_message("debug", f"  response len = {len(text_result)} chars")
+                    log_message("debug", f"  abandon      = {abandon_token}")
+                    log_message("debug", f"═══════════════════════════════════════════════════════════")
                     return {"response": text_result, "abandon_token": abandon_token}
                 except Exception as e:
                     import traceback
