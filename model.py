@@ -18,7 +18,7 @@ _llm_instance: Optional[Llama] = None
 _states: Dict[str, Any] = {}
 
 MODEL_CODE = "0bm"
-MAX_HISTORY = 4
+MAX_HISTORY = 200
 
 # Standardized logging helper: [HH:MM:SS | DD] [tag] : msg
 def log_message(tag: str, msg: str) -> None:
@@ -27,175 +27,6 @@ def log_message(tag: str, msg: str) -> None:
     now_str = ist_now.strftime("%H:%M:%S")
     day_str = ist_now.strftime("%d")
     print(f"[{now_str} | {day_str}] [{tag}] : {msg}", flush=True)
-
-def find_gguf_file() -> Path:
-    # Check current directory
-    for path in Path(".").glob("*.gguf"):
-        if "mmproj" not in path.name:
-            return path
-    # Check model/ directory
-    model_dir: Path = Path("model")
-    if model_dir.exists():
-        for path in model_dir.glob("*.gguf"):
-            if "mmproj" not in path.name:
-                return path
-    return Path("Qwen3.5-0.8B-Q4_K_M.gguf")
-
-def find_mmproj_file() -> Optional[Path]:
-    for path in Path(".").glob("*mmproj*.gguf"):
-        return path
-    model_dir: Path = Path("model")
-    if model_dir.exists():
-        for path in model_dir.glob("*mmproj*.gguf"):
-            return path
-    return None
-
-def get_llm() -> Llama:
-    global _llm_instance
-    if _llm_instance is None:
-        model_path: Path = find_gguf_file()
-        if not model_path.exists():
-            raise FileNotFoundError(f"No GGUF model file found. Expected one in root or model/ directory.")
-        
-        mmproj_path = find_mmproj_file()
-        chat_handler = None
-        if mmproj_path:
-            try:
-                from llama_cpp.llama_chat_format import LlavaChatHandler # type: ignore
-                log_message("system", f"Found vision projector file: {mmproj_path}")
-                chat_handler = LlavaChatHandler(clip_model_path=str(mmproj_path))
-            except Exception as e:
-                log_message("system", f"Warning: Failed to load LlavaChatHandler: {e}")
-        
-        # Optimize context and quantization specs
-        _llm_instance = Llama(
-            model_path=str(model_path),
-            n_threads=2,
-            n_ctx=40960,
-            flash_attn=True,
-            type_k=GGML_TYPE_Q8_0,
-            type_v=GGML_TYPE_Q8_0,
-            chat_handler=chat_handler
-        )
-    return _llm_instance
-
-def save_state_bg(state_file: Path, customer_obj: dict) -> None:
-    try:
-        tmp_file = state_file.with_suffix(f".{threading.get_ident()}.tmp")
-        with open(tmp_file, "wb") as sf:
-            pickle.dump(customer_obj, sf)
-        os.replace(tmp_file, state_file)
-        log_message("system", f"Background state saved to {state_file.name}")
-    except Exception as e:
-        log_message("system", f"Background state save warning: {e}")
-
-def run_summarization_bg(client_id: str, phone_number: str, history: list, system_prompt: str, persona: str, kb: str, convo_file: Path) -> None:
-    import base64
-    log_message("system", f"Starting background summarization for {phone_number}...")
-    try:
-        org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
-        res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=10)
-        kv_url = None
-        if res_dns.status_code == 200:
-            dns_data = res_dns.json()
-            kv_workers_dict = dns_data.get("kv-worker", {})
-            if kv_workers_dict:
-                for name, url in kv_workers_dict.items():
-                    if url:
-                        kv_url = url
-                        break
-        
-        if kv_url:
-            payload = {
-                "client_id": client_id,
-                "phone_number": phone_number,
-                "history": history,
-                "system_prompt": system_prompt,
-                "persona": persona,
-                "kb": kb
-            }
-            log_message("system", f"Sending background /summarize request to {kv_url} for client {client_id}")
-            res_sum = requests.post(f"{kv_url.rstrip('/')}/summarize", json=payload, timeout=600)
-            if res_sum.status_code == 200:
-                res_data = res_sum.json()
-                if res_data.get("status") == "success":
-                    state_bytes_b64 = res_data.get("state_bytes_base64")
-                    if state_bytes_b64:
-                        state_bytes = base64.b64decode(state_bytes_b64)
-                        payload_obj = pickle.loads(state_bytes)
-                        
-                        # Load any new messages that arrived while we were summarizing
-                        new_messages = []
-                        if convo_file.exists():
-                            try:
-                                with open(convo_file, "rb") as f:
-                                    current_obj = pickle.load(f)
-                                if isinstance(current_obj, dict):
-                                    current_history = current_obj.get("history", [])
-                                    if len(current_history) > len(history):
-                                        new_messages = current_history[len(history):]
-                                        log_message("system", f"Detected {len(new_messages)} new messages sent during summarization. Merging...")
-                            except Exception as read_err:
-                                log_message("system", f"Warning: Failed to read convo file for merge: {read_err}")
-                        
-                        summary_state = payload_obj["state"]
-                        summary_tokens = payload_obj["tokens"]
-                        
-                        if new_messages:
-                            async def eval_new_messages_on_summary() -> tuple[Any, list[int]]:
-                                async with _llm_lock:
-                                    llm = get_llm()
-                                    llm.load_state(summary_state)
-                                    llm.n_tokens = len(summary_tokens)
-                                    
-                                    merged_tokens = list(summary_tokens)
-                                    for msg in new_messages:
-                                        role = msg.get("role", "user")
-                                        content = msg.get("content", "")
-                                        
-                                        if role == "user":
-                                            turn_text = f"\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
-                                        else:
-                                            turn_text = f"{content}<|im_end|>\n"
-                                            
-                                        turn_tokens = llm.tokenize(turn_text.encode("utf-8"))
-                                        match_len = llm.n_tokens
-                                        for idx, tok in enumerate(turn_tokens):
-                                            llm.input_ids[match_len + idx] = tok
-                                            
-                                        llm.eval(turn_tokens)
-                                        merged_tokens.extend(turn_tokens)
-                                        
-                                    updated_state = llm.save_state()
-                                    return updated_state, merged_tokens
-                                    
-                            try:
-                                loop = asyncio.new_event_loop()
-                                summary_state, summary_tokens = loop.run_until_complete(eval_new_messages_on_summary())
-                                loop.close()
-                            except Exception as merge_err:
-                                log_message("system", f"Warning: Failed to merge new messages: {merge_err}")
-                        
-                        customer_obj = {
-                            "phone_number": phone_number,
-                            "state": summary_state,
-                            "tokens": summary_tokens,
-                            "history": new_messages,
-                            "msg_count": len(new_messages)
-                        }
-                        with open(convo_file, "wb") as sf:
-                            pickle.dump(customer_obj, sf)
-                        log_message("system", f"Background summarization complete for {phone_number}. State file updated and history reset.")
-                    else:
-                        log_message("system", f"Warning: /summarize success but empty state_bytes_base64 for {phone_number}")
-                else:
-                    log_message("system", f"Warning: /summarize failed: {res_data.get('detail')} for {phone_number}")
-            else:
-                log_message("system", f"Warning: /summarize status {res_sum.status_code} for {phone_number}")
-        else:
-            log_message("system", f"Warning: No active KV worker found to summarize history for {phone_number}")
-    except Exception as e:
-        log_message("system", f"Warning: Background summarization failed for {phone_number}: {e}")
 
 async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_number: Optional[str] = None, image_base64: Optional[str] = None) -> str:
     import base64
@@ -369,11 +200,6 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     match_len = len(evaluated_tokens)
                     if match_len > 0 and all_tokens[:match_len] == evaluated_tokens:
                         llm.n_tokens = match_len
-                        try:
-                            for i in range(match_len):
-                                llm.input_ids[i] = all_tokens[i]
-                        except Exception as e:
-                            log_message("system", f"Warning: Failed to sync input_ids: {e}")
                         log_message("system", f"Recycling KV cache: Preserving {match_len} prefix tokens. Appending {len(new_turn_tokens)} suffix tokens.")
                     else:
                         llm.reset()
@@ -404,7 +230,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         top_k=40,
                         top_p=0.9,
                         logit_bias=logit_bias,
-                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+                        stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
                     )
                     
                     text_result_chunks = []
@@ -415,9 +241,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     raw_text = "".join(text_result_chunks)
                     import re
                     cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text)
-                    for stop_token in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
-                        if stop_token in cleaned_text:
-                            cleaned_text = cleaned_text.split(stop_token)[0]
+                    
+                    # Cut off text cleanly at any ChatML tag or variant (e.g. <|im_start|, <|im_end|, <|im_start|}, etc.)
+                    cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', cleaned_text)[0]
+                    
                     # Extract <abandon> token before stripping it from visible reply
                     abandon_token: Optional[str] = None
                     abandon_match = re.search(r'<abandon>(.*?)</abandon>', cleaned_text, re.IGNORECASE | re.DOTALL)
@@ -463,14 +290,24 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             )
                             t.start()
                             
-                            # Check if msg_count reaches MAX_HISTORY to run summarization in the background
+                            # Check if msg_count reaches MAX_HISTORY (200 messages) to exclude the number persistently
                             if msg_count >= MAX_HISTORY:
-                                sum_t = threading.Thread(
-                                    target=run_summarization_bg,
-                                    args=(client_id, phone_number, history, system_prompt, persona, kb, convo_file),
-                                    daemon=True
-                                )
-                                sum_t.start()
+                                abandon_token = "MAX_LIMIT_REACHED"
+                                log_message("system", f"Phone number {phone_number} reached MAX_HISTORY limit ({msg_count} msgs). Excluding in Redis...")
+                                try:
+                                    org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
+                                    res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
+                                    if res_dns.status_code == 200:
+                                        redis_url = res_dns.json().get("redis-worker", {}).get("active")
+                                        if redis_url:
+                                            requests.post(
+                                                f"{redis_url.rstrip('/')}/add",
+                                                json={"key": f"excluded:{phone_number}", "value": "true"},
+                                                timeout=5
+                                            )
+                                            log_message("system", f"Successfully marked excluded:{phone_number} in Redis.")
+                                except Exception as ex_err:
+                                    log_message("system", f"Warning: Failed to publish excluded status to Redis: {ex_err}")
                         except Exception as save_err:
                             log_message("system", f"Warning: Failed to save updated state: {save_err}")
                     
