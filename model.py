@@ -266,7 +266,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         llm.reset()
                         log_message("system", f"Fresh context run: Evaluating all {len(all_tokens)} tokens.")
 
-                    # Apply logit_bias to ban thought tokens
+                    # Apply logit_bias to ban thought tokens and suppress <stop> token
                     logit_bias = {}
                     try:
                         thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
@@ -276,6 +276,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         end_think_id = llm.tokenize(b"</think>")[-1]
                         logit_bias[think_id] = -100.0
                         logit_bias[end_think_id] = -100.0
+
+                        # Suppress <stop> token — we only use <abandon> now
+                        stop_token_id = llm.tokenize(b"<stop>")[-1]
+                        logit_bias[stop_token_id] = -100.0
                     except Exception:
                         pass
 
@@ -301,8 +305,16 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     for stop_token in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
                         if stop_token in cleaned_text:
                             cleaned_text = cleaned_text.split(stop_token)[0]
+                    # Extract <abandon> token before stripping it from visible reply
+                    abandon_token: Optional[str] = None
+                    abandon_match = re.search(r'<abandon>(.*?)</abandon>', cleaned_text, re.IGNORECASE | re.DOTALL)
+                    if abandon_match:
+                        abandon_token = abandon_match.group(1).strip()
+                    # Strip both <abandon> and legacy <stop> tags from the visible reply
+                    cleaned_text = re.sub(r'<abandon>[\s\S]*?</abandon>', '', cleaned_text, flags=re.IGNORECASE)
+                    cleaned_text = re.sub(r'<stop>[\s\S]*?</stop>', '', cleaned_text, flags=re.IGNORECASE)
                     text_result = cleaned_text.strip()
-                    log_message("response", text_result)
+                    log_message("response", f"{text_result}{' [ABANDON:' + abandon_token + ']' if abandon_token else ''}")
                     
                     # 4. Save updated conversation state
                     if phone_number:
@@ -386,7 +398,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         except Exception as save_err:
                             log_message("system", f"Warning: Failed to save updated state: {save_err}")
                     
-                    return text_result
+                    return {"response": text_result, "abandon_token": abandon_token}
             except Exception as e:
                 import traceback
                 traceback.print_exc()
