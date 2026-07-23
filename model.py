@@ -261,6 +261,11 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     match_len = len(evaluated_tokens)
                     if match_len > 0 and all_tokens[:match_len] == evaluated_tokens:
                         llm.n_tokens = match_len
+                        try:
+                            for i in range(match_len):
+                                llm.input_ids[i] = all_tokens[i]
+                        except Exception as e:
+                            log_message("system", f"Warning: Failed to sync input_ids: {e}")
                         log_message("system", f"Recycling KV cache: Preserving {match_len} prefix tokens. Appending {len(new_turn_tokens)} suffix tokens.")
                     else:
                         llm.reset()
@@ -314,6 +319,14 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     cleaned_text = re.sub(r'<abandon>[\s\S]*?</abandon>', '', cleaned_text, flags=re.IGNORECASE)
                     cleaned_text = re.sub(r'<stop>[\s\S]*?</stop>', '', cleaned_text, flags=re.IGNORECASE)
                     text_result = cleaned_text.strip()
+                    
+                    if abandon_token:
+                        greetings = ["hi", "hello", "good morning", "good afternoon", "good evening", "hey"]
+                        lower_reply = text_result.lower()
+                        if any(g in lower_reply for g in greetings) and len(text_result) < 150:
+                            log_message("system", f"Ignored false-positive abandon token '{abandon_token}' because response is a greeting.")
+                            abandon_token = None
+                            
                     log_message("response", f"{text_result}{' [ABANDON:' + abandon_token + ']' if abandon_token else ''}")
                     
                     # 4. Save updated conversation state
