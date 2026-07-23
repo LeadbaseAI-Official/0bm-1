@@ -181,12 +181,14 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     msg_count = 0
                     loaded_convo = False
                     load_source = "NONE"
+                    loaded_n_tokens = 0  # Truth from KV cache after load_state
 
                     # ─── STEP 2: Try RAM LRU Cache (Level-1) ───
                     if phone_number and phone_number in _ram_states_cache:
                         ram_obj = _ram_states_cache[phone_number]
                         _ram_states_cache.move_to_end(phone_number)
                         llm.load_state(ram_obj["state"])
+                        loaded_n_tokens = llm.n_tokens  # KV cache truth
                         history = ram_obj.get("history", [])
                         msg_count = ram_obj.get("msg_count", 0)
                         convo_tokens = ram_obj.get("tokens", [])
@@ -195,9 +197,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         log_message("debug", f"STEP 2: RAM LRU HIT ✓")
                         log_message("debug", f"  phone          = {phone_number}")
                         log_message("debug", f"  convo_tokens   = {len(convo_tokens)} tokens loaded from RAM")
+                        log_message("debug", f"  loaded_n_tokens= {loaded_n_tokens} (KV cache truth)")
                         log_message("debug", f"  history turns  = {len(history)} messages")
                         log_message("debug", f"  msg_count      = {msg_count}")
-                        log_message("debug", f"  llm.n_tokens   = {llm.n_tokens} (after load_state)")
+                        log_message("debug", f"  SYNC CHECK     = {'✓ MATCH' if loaded_n_tokens == len(convo_tokens) else '✗ MISMATCH! KV=' + str(loaded_n_tokens) + ' tokens=' + str(len(convo_tokens))}")
                         log_message("debug", f"  tokens[:5]     = {convo_tokens[:5] if convo_tokens else '[]'}")
                         log_message("debug", f"  tokens[-5:]    = {convo_tokens[-5:] if convo_tokens else '[]'}")
                     else:
@@ -273,6 +276,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                     
                                 if isinstance(customer_obj, dict) and "state" in customer_obj:
                                     llm.load_state(customer_obj["state"])
+                                    loaded_n_tokens = llm.n_tokens  # KV cache truth
                                     convo_tokens = customer_obj.get("tokens", [])
                                     history = customer_obj.get("history", [])
                                     msg_count = customer_obj.get("msg_count", 0)
@@ -280,6 +284,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                     load_source = "DISK"
                                 else:
                                     llm.load_state(customer_obj)
+                                    loaded_n_tokens = llm.n_tokens  # KV cache truth
                                     convo_tokens = []
                                     history = []
                                     msg_count = 0
@@ -288,9 +293,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 log_message("debug", f"STEP 5: Disk state LOADED ✓ (source={load_source})")
                                 log_message("debug", f"  file           = {convo_file.name}")
                                 log_message("debug", f"  convo_tokens   = {len(convo_tokens)} tokens")
+                                log_message("debug", f"  loaded_n_tokens= {loaded_n_tokens} (KV cache truth)")
                                 log_message("debug", f"  history turns  = {len(history)} messages")
                                 log_message("debug", f"  msg_count      = {msg_count}")
-                                log_message("debug", f"  llm.n_tokens   = {llm.n_tokens} (after load_state)")
+                                log_message("debug", f"  SYNC CHECK     = {'✓ MATCH' if loaded_n_tokens == len(convo_tokens) else '✗ MISMATCH! KV=' + str(loaded_n_tokens) + ' tokens=' + str(len(convo_tokens))}")
                                 log_message("debug", f"  tokens[:5]     = {convo_tokens[:5] if convo_tokens else '[]'}")
                                 log_message("debug", f"  tokens[-5:]    = {convo_tokens[-5:] if convo_tokens else '[]'}")
                             except Exception as e:
@@ -299,11 +305,12 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         if not loaded_convo:
                             if loaded_global and global_cache_state:
                                 llm.load_state(global_cache_state)
+                                loaded_n_tokens = llm.n_tokens  # KV cache truth
                                 convo_tokens = prefix_tokens
                                 load_source = "GLOBAL_PREFIX"
                                 log_message("debug", f"STEP 5: Initialized from global prefix (source={load_source})")
                                 log_message("debug", f"  convo_tokens   = {len(convo_tokens)} (= prefix_tokens)")
-                                log_message("debug", f"  llm.n_tokens   = {llm.n_tokens}")
+                                log_message("debug", f"  loaded_n_tokens= {loaded_n_tokens} (KV cache truth)")
                             else:
                                 llm.reset()
                                 convo_tokens = []
@@ -314,11 +321,38 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     evaluated_tokens = convo_tokens if (loaded_convo or (phone_number and phone_number in _ram_states_cache)) else (prefix_tokens if 'prefix_tokens' in dir() else [])
                     all_tokens = evaluated_tokens + new_turn_tokens
                     
+                    # Exact timeline alignment logic:
+                    # Compare evaluated_tokens array against actual internal input_ids in the model KV cache.
+                    # Find exact longest matching prefix index to prevent full re-evaluation on partial KV cache removal warnings.
                     n_tokens_before_set = llm.n_tokens
-                    llm.n_tokens = len(evaluated_tokens)
+                    target_match_len = loaded_n_tokens if loaded_n_tokens > 0 else len(evaluated_tokens)
+                    
+                    # Verify token-by-token alignment if input_ids is available
+                    try:
+                        kv_input_ids = llm.input_ids.tolist()[:target_match_len]
+                        if len(kv_input_ids) > 0 and len(evaluated_tokens) >= len(kv_input_ids):
+                            # Find longest exact matching prefix boundary
+                            match_idx = 0
+                            for idx in range(min(len(kv_input_ids), len(evaluated_tokens))):
+                                if kv_input_ids[idx] == evaluated_tokens[idx]:
+                                    match_idx += 1
+                                else:
+                                    break
+                            if match_idx < target_match_len:
+                                log_message("debug", f"STEP 6: ⚠ TIMELINE MISMATCH AT POS {match_idx}/{target_match_len}!")
+                                log_message("debug", f"  Rewinding timeline to matching prefix index {match_idx}")
+                                target_match_len = match_idx
+                                evaluated_tokens = evaluated_tokens[:target_match_len]
+                                all_tokens = evaluated_tokens + new_turn_tokens
+                    except Exception:
+                        pass
+
+                    llm.n_tokens = target_match_len
                     
                     log_message("debug", f"STEP 6: Token alignment for prefix matching")
                     log_message("debug", f"  load_source         = {load_source}")
+                    log_message("debug", f"  loaded_n_tokens     = {loaded_n_tokens} (KV cache truth)")
+                    log_message("debug", f"  target_match_len    = {target_match_len}")
                     log_message("debug", f"  evaluated_tokens    = {len(evaluated_tokens)}")
                     log_message("debug", f"  new_turn_tokens     = {len(new_turn_tokens)}")
                     log_message("debug", f"  all_tokens          = {len(all_tokens)} (= evaluated + new_turn)")
@@ -345,9 +379,12 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         pass
                     log_message("debug", f"STEP 7: logit_bias = {len(logit_bias)} token(s) banned")
 
-                    # ─── STEP 8: Run create_completion with fallback alignment ───
+                    # ─── STEP 8 & 9: Evaluation & Streaming with Timeline Fallback ───
                     log_message("debug", f"STEP 8: Calling create_completion(prompt={len(all_tokens)} tokens, llm.n_tokens={llm.n_tokens})")
                     fallback_used = False
+                    text_result_chunks = []
+                    gen_token_count = 0
+                    
                     try:
                         completion_generator = llm.create_completion(
                             prompt=all_tokens,
@@ -359,18 +396,30 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             logit_bias=logit_bias,
                             stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
                         )
-                        log_message("debug", f"STEP 8: create_completion returned generator OK ✓")
+                        for chunk in completion_generator:
+                            token_text = chunk["choices"][0]["text"]
+                            text_result_chunks.append(token_text)
+                            gen_token_count += 1
+                        log_message("debug", f"STEP 8/9: Normal evaluation & generation completed OK ✓")
                     except Exception as eval_err:
                         fallback_used = True
-                        log_message("debug", f"STEP 8: create_completion FAILED ✗: {eval_err}")
+                        text_result_chunks = []
+                        gen_token_count = 0
+                        log_message("debug", f"STEP 8 FALLBACK TRIGGERED ✗: {eval_err}")
+                        
+                        # Timeline Alignment Fallback:
+                        # 1. Calculate exact matching boundary
                         match_len = min(llm.n_tokens, len(evaluated_tokens))
+                        
+                        # 2. Rewind evaluation pointer to matching index
                         llm.n_tokens = match_len
                         aligned_prompt = all_tokens[match_len:] if match_len > 0 else all_tokens
-                        log_message("debug", f"STEP 8 FALLBACK: Timeline alignment triggered")
-                        log_message("debug", f"  match_len        = {match_len}")
-                        log_message("debug", f"  llm.n_tokens     = {llm.n_tokens} (rewound)")
-                        log_message("debug", f"  aligned_prompt   = {len(aligned_prompt)} suffix tokens")
-                        log_message("debug", f"  aligned[:5]      = {aligned_prompt[:5]}")
+                        log_message("debug", f"STEP 8 FALLBACK: Timeline aligned to pos {match_len}")
+                        log_message("debug", f"  llm.n_tokens rewound to {llm.n_tokens}")
+                        log_message("debug", f"  aligned_prompt suffix = {len(aligned_prompt)} tokens")
+                        log_message("debug", f"  aligned[:5]            = {aligned_prompt[:5] if len(aligned_prompt) > 0 else '[]'}")
+                        
+                        # 3. Retry evaluation from matching suffix point
                         completion_generator = llm.create_completion(
                             prompt=aligned_prompt,
                             max_tokens=512,
@@ -381,15 +430,11 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             logit_bias=logit_bias,
                             stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
                         )
-                        log_message("debug", f"STEP 8 FALLBACK: Retry create_completion OK ✓")
-                    
-                    # ─── STEP 9: Stream generation ───
-                    text_result_chunks = []
-                    gen_token_count = 0
-                    for chunk in completion_generator:
-                        token_text = chunk["choices"][0]["text"]
-                        text_result_chunks.append(token_text)
-                        gen_token_count += 1
+                        for chunk in completion_generator:
+                            token_text = chunk["choices"][0]["text"]
+                            text_result_chunks.append(token_text)
+                            gen_token_count += 1
+                        log_message("debug", f"STEP 8/9 FALLBACK: Retry generation completed OK ✓")
                         
                     raw_text = "".join(text_result_chunks)
                     import re
@@ -428,8 +473,24 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             msg_count += 2
                             
                             state_obj = llm.save_state()
-                            response_tokens = llm.tokenize(raw_text.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
-                            full_tokens = all_tokens + response_tokens
+                            
+                            # CRITICAL FIX: Get ACTUAL token IDs from llm internal state
+                            # DO NOT re-tokenize raw_text — it produces DIFFERENT token IDs
+                            # than what llama.cpp actually generated into the KV cache.
+                            # e.g. model generates 71 tokens but tokenize(decode(71 tokens)) = 73 tokens
+                            actual_n = llm.n_tokens
+                            try:
+                                full_tokens = llm.input_ids.tolist()
+                                token_source = "input_ids"
+                            except Exception:
+                                try:
+                                    full_tokens = list(llm._input_ids[:actual_n])
+                                    token_source = "_input_ids"
+                                except Exception:
+                                    # Last resort fallback: re-tokenize (may cause mismatch)
+                                    response_tokens = llm.tokenize(raw_text.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
+                                    full_tokens = all_tokens + response_tokens
+                                    token_source = "re-tokenized (FALLBACK)"
                             
                             customer_obj = {
                                 "phone_number": phone_number,
@@ -440,9 +501,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             }
                             
                             log_message("debug", f"STEP 10: Saving state")
-                            log_message("debug", f"  all_tokens       = {len(all_tokens)} (prompt input)")
-                            log_message("debug", f"  response_tokens  = {len(response_tokens)} (generated output tokenized)")
-                            log_message("debug", f"  full_tokens      = {len(full_tokens)} (= all + response = SAVED)")
+                            log_message("debug", f"  token_source     = {token_source}")
+                            log_message("debug", f"  llm.n_tokens     = {actual_n} (KV cache truth)")
+                            log_message("debug", f"  full_tokens      = {len(full_tokens)} (SAVED)")
+                            log_message("debug", f"  SYNC CHECK       = {'✓ EXACT MATCH' if len(full_tokens) == actual_n else '✗ MISMATCH! saved=' + str(len(full_tokens)) + ' kv=' + str(actual_n)}")
                             log_message("debug", f"  full[:5]         = {full_tokens[:5]}")
                             log_message("debug", f"  full[-5:]        = {full_tokens[-5:]}")
                             log_message("debug", f"  state_obj size   = {len(state_obj) if hasattr(state_obj, '__len__') else 'N/A'}")
@@ -452,22 +514,23 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             # Cache active session in Level-1 RAM LRU cache (Capacity: 5)
                             _ram_states_cache[phone_number] = customer_obj
                             _ram_states_cache.move_to_end(phone_number)
-                            ram_evicted = None
+                            ram_evicted_phone = None
                             if len(_ram_states_cache) > RAM_CACHE_CAPACITY:
-                                ram_evicted, _ = _ram_states_cache.popitem(last=False)
+                                ram_evicted_phone, ram_evicted_obj = _ram_states_cache.popitem(last=False)
+                                evicted_file = STATES_DIR / f"{ram_evicted_phone}_phone.bin"
+                                t = threading.Thread(
+                                    target=save_state_bg,
+                                    args=(evicted_file, ram_evicted_obj),
+                                    daemon=True
+                                )
+                                t.start()
+                                log_message("debug", f"STEP 10: RAM cache capacity (5) reached. Evicted {ram_evicted_phone} to disk ({evicted_file.name})")
+                            else:
+                                log_message("debug", f"STEP 10: State updated in RAM LRU cache (0 disk I/O for active session).")
                             
-                            log_message("debug", f"STEP 10: RAM LRU cache updated")
                             log_message("debug", f"  RAM keys         = {list(_ram_states_cache.keys())}")
                             log_message("debug", f"  RAM size         = {len(_ram_states_cache)}/{RAM_CACHE_CAPACITY}")
-                            log_message("debug", f"  RAM evicted      = {ram_evicted or 'None'}")
-                            
-                            t = threading.Thread(
-                                target=save_state_bg,
-                                args=(convo_file, customer_obj),
-                                daemon=True
-                            )
-                            t.start()
-                            log_message("debug", f"STEP 10: Disk save thread launched for {convo_file.name if convo_file else 'None'}")
+                            log_message("debug", f"  RAM evicted      = {ram_evicted_phone or 'None'}")
                             
                             # Check if msg_count reaches MAX_HISTORY (200 messages) to exclude the number persistently
                             if msg_count >= MAX_HISTORY:
