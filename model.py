@@ -152,10 +152,10 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     text_result = "".join(text_chunks)
                     log_message("response", text_result)
                     return text_result
-                else:
-                    if image_base64:
-                        log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
-                        prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
+                    else:
+                        if image_base64:
+                            log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
+                            prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
                     
                     # Ensure dynamic folders exist
                     global_cache_dir = Path("global_cache")
