@@ -409,8 +409,8 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             log_message("system", f"Warning: Failed to save updated state: {save_err}")
                     
                     return {"response": text_result, "abandon_token": abandon_token}
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return f"Exception raised while running llama-cpp: {e}"
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    return f"Exception raised while running llama-cpp: {e}"
         return await asyncio.to_thread(evaluate_query)
