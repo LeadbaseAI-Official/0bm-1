@@ -463,9 +463,10 @@ async def chat(req: ChatRequest) -> dict:
     if not req.prompt:
         raise HTTPException(status_code=400, detail="Prompt parameter is required.")
     
-    response_text: str = await run_model_query(req.prompt, req.client_id, req.phone_number, req.image_base64)
+    result: dict = await run_model_query(req.prompt, req.client_id, req.phone_number, req.image_base64)
     return {
-        "response": response_text,
+        "response": result.get("response", ""),
+        "abandon_token": result.get("abandon_token"),
         "prompt": req.prompt
     }
 
