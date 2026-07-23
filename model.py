@@ -110,12 +110,12 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                 try:
                     llm: Llama = get_llm()
                     log_message("system", f"Processing query for phone {phone_number} on single shared model weights...")
-                
-                # Vision mode handling
-                if image_base64 and getattr(llm, "chat_handler", None) is not None:
-                    log_message("system", f"Running vision query with image of size {len(image_base64)} characters")
-                    if not image_base64.startswith("data:image"):
-                        image_base64 = f"data:image/jpeg;base64,{image_base64}"
+                    
+                    # Vision mode handling
+                    if image_base64 and getattr(llm, "chat_handler", None) is not None:
+                        log_message("system", f"Running vision query with image of size {len(image_base64)} characters")
+                        if not image_base64.startswith("data:image"):
+                            image_base64 = f"data:image/jpeg;base64,{image_base64}"
                     
                     logit_bias = {}
                     try:
