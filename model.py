@@ -13,10 +13,15 @@ import requests
 STATES_DIR = Path("states")
 STATES_DIR.mkdir(parents=True, exist_ok=True)
 
-_llm_lock = asyncio.Lock()
+from collections import OrderedDict
+
+PARALLEL_SLOTS = 3
+_concurrency_semaphore: Optional[asyncio.Semaphore] = None
+_eval_lock = threading.Lock()
 _llm_instance: Optional[Llama] = None
-_states: Dict[str, Any] = {}
-_active_phone_number: Optional[str] = None
+
+RAM_CACHE_CAPACITY = 5
+_ram_states_cache: OrderedDict[str, dict] = OrderedDict()
 
 MODEL_CODE = "0bm"
 MAX_HISTORY = 200
@@ -78,6 +83,7 @@ def get_llm() -> Llama:
             type_v=GGML_TYPE_Q8_0,
             chat_handler=chat_handler
         )
+        log_message("system", "Single model weight instance initialized successfully (Supports 3 Parallel Concurrency Slots).")
     return _llm_instance
 
 def save_state_bg(state_file: Path, customer_obj: dict) -> None:
@@ -92,12 +98,18 @@ def save_state_bg(state_file: Path, customer_obj: dict) -> None:
 
 async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_number: Optional[str] = None, image_base64: Optional[str] = None) -> str:
     import base64
-    async with _llm_lock:
+    global _concurrency_semaphore
+    if _concurrency_semaphore is None:
+        _concurrency_semaphore = asyncio.Semaphore(PARALLEL_SLOTS)
+
+    async with _concurrency_semaphore:
         def evaluate_query() -> str:
             nonlocal prompt, image_base64
-            global _active_phone_number
-            try:
-                llm: Llama = get_llm()
+            global _ram_states_cache
+            with _eval_lock:
+                try:
+                    llm: Llama = get_llm()
+                    log_message("system", f"Processing query for phone {phone_number} on single shared model weights...")
                 
                 # Vision mode handling
                 if image_base64 and getattr(llm, "chat_handler", None) is not None:
@@ -156,23 +168,20 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     convo_tokens = []
                     history = []
                     msg_count = 0
-                    prompt_to_evaluate = new_turn_tokens
+                    loaded_convo = False
 
-                    # Active RAM shortcut: If same phone number is already active in RAM, skip disk reload completely!
-                    if phone_number and _active_phone_number == phone_number and llm.n_tokens > 0:
-                        log_message("system", f"Phone {phone_number} active in RAM ({llm.n_tokens} tokens). Appending {len(new_turn_tokens)} suffix tokens.")
-                        if convo_file and convo_file.exists():
-                            try:
-                                with open(convo_file, "rb") as f:
-                                    customer_obj = pickle.load(f)
-                                if isinstance(customer_obj, dict):
-                                    history = customer_obj.get("history", [])
-                                    msg_count = customer_obj.get("msg_count", 0)
-                                    convo_tokens = customer_obj.get("tokens", [])
-                            except Exception:
-                                pass
+                    # 1. RAM LRU Cache check (Capacity: 5 active sessions in memory)
+                    if phone_number and phone_number in _ram_states_cache:
+                        log_message("system", f"RAM LRU Hit for {phone_number} ({len(_ram_states_cache)}/5 in RAM). Restoring state from RAM...")
+                        ram_obj = _ram_states_cache[phone_number]
+                        _ram_states_cache.move_to_end(phone_number)
+                        llm.load_state(ram_obj["state"])
+                        history = ram_obj.get("history", [])
+                        msg_count = ram_obj.get("msg_count", 0)
+                        convo_tokens = ram_obj.get("tokens", [])
+                        loaded_convo = True
                     else:
-                        # 1. Load Client Global Cache first (pre-compiled prefix)
+                        # 2. Load Client Global Cache first (pre-compiled prefix)
                         global_cache_file = global_cache_dir / f"{client_id}_global.bin" if client_id else None
                         if global_cache_file and not global_cache_file.exists():
                             global_cache_file = global_cache_dir / f"{client_id}.bin"
@@ -198,8 +207,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             except Exception as e:
                                 log_message("system", f"Warning: Failed to load global cache: {e}")
                         
-                        # 2. Load User Convo History cache from phonenumber_phone.bin
-                        loaded_convo = False
+                        # 3. Load User Convo History cache from phonenumber_phone.bin or Redis
                         if convo_file and not convo_file.exists() and phone_number and loaded_global:
                             org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
                             try:
@@ -251,14 +259,12 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 llm.reset()
                                 convo_tokens = []
                                 log_message("system", "No client global cache or conversation history, running from scratch.")
-                                
-                        _active_phone_number = phone_number
-                        
-                        # When loading state, pass only incremental turn tokens if KV state is loaded
-                        if llm.n_tokens > 0:
-                            prompt_to_evaluate = new_turn_tokens
-                        else:
-                            prompt_to_evaluate = convo_tokens + new_turn_tokens
+
+                    # Pass incremental turn tokens when KV state is loaded
+                    if llm.n_tokens > 0:
+                        prompt_to_evaluate = new_turn_tokens
+                    else:
+                        prompt_to_evaluate = convo_tokens + new_turn_tokens
 
                     # Apply logit_bias to ban thought tokens and suppress <stop> token
                     logit_bias = {}
@@ -338,6 +344,13 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                                 "msg_count": msg_count
                             }
                             
+                            # Cache active session in Level-1 RAM LRU cache (Capacity: 5)
+                            _ram_states_cache[phone_number] = customer_obj
+                            _ram_states_cache.move_to_end(phone_number)
+                            if len(_ram_states_cache) > RAM_CACHE_CAPACITY:
+                                evicted_phone, _ = _ram_states_cache.popitem(last=False)
+                                log_message("system", f"RAM LRU limit reached (5). Evicted {evicted_phone} from RAM cache.")
+                            
                             t = threading.Thread(
                                 target=save_state_bg,
                                 args=(convo_file, customer_obj),
@@ -399,5 +412,4 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                 import traceback
                 traceback.print_exc()
                 return f"Exception raised while running llama-cpp: {e}"
-
         return await asyncio.to_thread(evaluate_query)
