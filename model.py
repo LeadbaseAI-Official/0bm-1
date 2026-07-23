@@ -111,52 +111,53 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     llm: Llama = get_llm()
                     log_message("system", f"Processing query for phone {phone_number} on single shared model weights...")
                     
-                    # Vision mode handling
+                    # Vision mode handling: use create_chat_completion if vision handler is available,
+                    # otherwise fall back to text-only create_completion path.
                     if image_base64 and getattr(llm, "chat_handler", None) is not None:
                         log_message("system", f"Running vision query with image of size {len(image_base64)} characters")
                         if not image_base64.startswith("data:image"):
                             image_base64 = f"data:image/jpeg;base64,{image_base64}"
-                    
-                    logit_bias = {}
-                    try:
-                        # Ban thought and thinking tokens
-                        thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
-                        logit_bias[thought_token_id] = -100.0
-                        think_id = llm.tokenize(b"<think>")[-1]
-                        end_think_id = llm.tokenize(b"</think>")[-1]
-                        logit_bias[think_id] = -100.0
-                        logit_bias[end_think_id] = -100.0
-                    except Exception:
-                        pass
 
-                    response_generator = llm.create_chat_completion(
-                        messages=[
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "text", "text": prompt},
-                                    {"type": "image_url", "image_url": {"url": image_base64}}
-                                ]
-                            }
-                        ],
-                        max_tokens=512,
-                        stream=True,
-                        logit_bias=logit_bias
-                    )
-                    text_chunks = []
-                    for chunk in response_generator:
-                        delta = chunk["choices"][0]["delta"]
-                        if "content" in delta:
-                            token_text = delta["content"]
-                            text_chunks.append(token_text)
-                    text_result = "".join(text_chunks)
-                    log_message("response", text_result)
-                    return text_result
+                        logit_bias = {}
+                        try:
+                            # Ban thought and thinking tokens
+                            thought_token_id = llm.tokenize(b"<|channel>thought")[-1]
+                            logit_bias[thought_token_id] = -100.0
+                            think_id = llm.tokenize(b"<think>")[-1]
+                            end_think_id = llm.tokenize(b"</think>")[-1]
+                            logit_bias[think_id] = -100.0
+                            logit_bias[end_think_id] = -100.0
+                        except Exception:
+                            pass
+
+                        response_generator = llm.create_chat_completion(
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": prompt},
+                                        {"type": "image_url", "image_url": {"url": image_base64}}
+                                    ]
+                                }
+                            ],
+                            max_tokens=512,
+                            stream=True,
+                            logit_bias=logit_bias
+                        )
+                        text_chunks = []
+                        for chunk in response_generator:
+                            delta = chunk["choices"][0]["delta"]
+                            if "content" in delta:
+                                token_text = delta["content"]
+                                text_chunks.append(token_text)
+                        text_result = "".join(text_chunks)
+                        log_message("response", text_result)
+                        return text_result
                     else:
                         if image_base64:
                             log_message("system", f"Text fallback mode: Received image of size {len(image_base64)} characters")
                             prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
-                    
+
                     # Ensure dynamic folders exist
                     global_cache_dir = Path("global_cache")
                     global_cache_dir.mkdir(exist_ok=True)
