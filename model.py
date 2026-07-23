@@ -289,16 +289,33 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     except Exception:
                         pass
 
-                    completion_generator = llm.create_completion(
-                        prompt=all_tokens,
-                        max_tokens=512,
-                        stream=True,
-                        temperature=0.7,
-                        top_k=40,
-                        top_p=0.9,
-                        logit_bias=logit_bias,
-                        stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
-                    )
+                    try:
+                        completion_generator = llm.create_completion(
+                            prompt=all_tokens,
+                            max_tokens=512,
+                            stream=True,
+                            temperature=0.7,
+                            top_k=40,
+                            top_p=0.9,
+                            logit_bias=logit_bias,
+                            stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
+                        )
+                    except Exception as eval_err:
+                        log_message("system", f"Fallback timeline alignment triggered: {eval_err}. Aligning to last matching prefix...")
+                        match_len = min(llm.n_tokens, len(evaluated_tokens))
+                        llm.n_tokens = match_len
+                        aligned_prompt = all_tokens[match_len:] if match_len > 0 else all_tokens
+                        log_message("system", f"Resuming evaluation from token index {match_len} ({len(aligned_prompt)} suffix tokens)...")
+                        completion_generator = llm.create_completion(
+                            prompt=aligned_prompt,
+                            max_tokens=512,
+                            stream=True,
+                            temperature=0.7,
+                            top_k=40,
+                            top_p=0.9,
+                            logit_bias=logit_bias,
+                            stop=["<|im_end|>", "<|im_start|>", "<|im_end|}", "<|im_start|}", "<|endoftext|>"]
+                        )
                     
                     text_result_chunks = []
                     for chunk in completion_generator:
@@ -340,7 +357,8 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             msg_count += 2
                             
                             state_obj = llm.save_state()
-                            full_tokens = all_tokens
+                            response_tokens = llm.tokenize(raw_text.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
+                            full_tokens = all_tokens + response_tokens
                             
                             customer_obj = {
                                 "phone_number": phone_number,
