@@ -319,6 +319,9 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
 
                     # ─── STEP 6: Build all_tokens & set n_tokens for prefix matching ───
                     evaluated_tokens = convo_tokens if (loaded_convo or (phone_number and phone_number in _ram_states_cache)) else (prefix_tokens if 'prefix_tokens' in dir() else [])
+                    if loaded_n_tokens > 0 and len(evaluated_tokens) > loaded_n_tokens:
+                        log_message("debug", f"STEP 6: Truncated evaluated_tokens array from {len(evaluated_tokens)} to KV truth ({loaded_n_tokens})")
+                        evaluated_tokens = evaluated_tokens[:loaded_n_tokens]
                     all_tokens = evaluated_tokens + new_turn_tokens
                     
                     # Exact timeline alignment logic:
@@ -480,14 +483,13 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             # e.g. model generates 71 tokens but tokenize(decode(71 tokens)) = 73 tokens
                             actual_n = llm.n_tokens
                             try:
-                                full_tokens = llm.input_ids.tolist()
-                                token_source = "input_ids"
+                                full_tokens = llm.input_ids.tolist()[:actual_n]
+                                token_source = "input_ids[:actual_n]"
                             except Exception:
                                 try:
                                     full_tokens = list(llm._input_ids[:actual_n])
-                                    token_source = "_input_ids"
+                                    token_source = "_input_ids[:actual_n]"
                                 except Exception:
-                                    # Last resort fallback: re-tokenize (may cause mismatch)
                                     response_tokens = llm.tokenize(raw_text.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
                                     full_tokens = all_tokens + response_tokens
                                     token_source = "re-tokenized (FALLBACK)"
