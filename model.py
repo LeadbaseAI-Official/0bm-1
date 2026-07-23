@@ -16,6 +16,7 @@ STATES_DIR.mkdir(parents=True, exist_ok=True)
 _llm_lock = asyncio.Lock()
 _llm_instance: Optional[Llama] = None
 _states: Dict[str, Any] = {}
+_active_phone_number: Optional[str] = None
 
 MODEL_CODE = "0bm"
 MAX_HISTORY = 200
@@ -94,6 +95,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
     async with _llm_lock:
         def evaluate_query() -> str:
             nonlocal prompt, image_base64
+            global _active_phone_number
             try:
                 llm: Llama = get_llm()
                 
@@ -147,124 +149,116 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                     global_cache_dir = Path("global_cache")
                     global_cache_dir.mkdir(exist_ok=True)
                     
-                    # 1. Load Client Global Cache first (pre-compiled prefix)
-                    # Support clientid_global.bin as priority, fallback to client_id.bin
-                    global_cache_file = global_cache_dir / f"{client_id}_global.bin" if client_id else None
-                    if global_cache_file and not global_cache_file.exists():
-                        global_cache_file = global_cache_dir / f"{client_id}.bin"
-                    
-                    loaded_global = False
-                    prefix_tokens = []
-                    global_cache_state = None
-                    
-                    if global_cache_file and global_cache_file.exists():
-                        try:
-                            log_message("system", f"Restoring client global cache: {global_cache_file.name}")
-                            with open(global_cache_file, "rb") as f:
-                                payload_obj = pickle.load(f)
-                            
-                            if isinstance(payload_obj, dict) and "state" in payload_obj:
-                                global_cache_state = payload_obj["state"]
-                                prefix_tokens = payload_obj.get("tokens", [])
-                            else:
-                                global_cache_state = payload_obj
-                                prefix_tokens = []
-                                
-                            loaded_global = True
-                        except Exception as e:
-                            log_message("system", f"Warning: Failed to load global cache: {e}")
-                    
-                    # Extract system prompt, persona, and KB from global cache
-                    system_prompt, persona, kb = "", "", ""
-                    if loaded_global and prefix_tokens:
-                        try:
-                            system_prompt = llm.detokenize(prefix_tokens).decode("utf-8", errors="ignore")
-                            parts = system_prompt.split("Persona:")
-                            if len(parts) > 1:
-                                kb_parts = parts[1].split("Knowledge Base (Authoritative Facts):")
-                                if len(kb_parts) > 1:
-                                    persona = kb_parts[0].strip()
-                                    kb = kb_parts[1].replace("<|im_end|>", "").strip()
-                                else:
-                                    persona = parts[1].replace("<|im_end|>", "").strip()
-                        except Exception as parse_err:
-                            log_message("system", f"Warning: Failed to parse system text: {parse_err}")
+                    new_turn_text = f"\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                    new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
 
-                    # 2. Load User Convo History cache from phonenumber_phone.bin
                     convo_file = STATES_DIR / f"{phone_number}_phone.bin" if phone_number else None
                     convo_tokens = []
                     history = []
                     msg_count = 0
-                    loaded_convo = False
-                    
-                    # On-demand state restoration if missing locally
-                    if convo_file and not convo_file.exists() and phone_number and loaded_global:
-                        org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
-                        try:
-                            res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
-                            if res_dns.status_code == 200:
-                                redis_url = res_dns.json().get("redis-worker", {}).get("active")
-                                if redis_url:
-                                    log_message("system", f"Local convo cache missing. Querying active Redis for state:{phone_number}...")
-                                    res_redis = requests.get(f"{redis_url.rstrip('/')}/get?key=state:{phone_number}", timeout=10)
-                                    if res_redis.status_code == 200:
-                                        payload = res_redis.json().get("value", "")
-                                        if payload:
-                                            import gzip
-                                            compressed_bytes = base64.b64decode(payload)
-                                            decompressed = gzip.decompress(compressed_bytes)
-                                            with open(convo_file, "wb") as f:
-                                                f.write(decompressed)
-                                            log_message("system", f"Successfully hydrated convo cache for {phone_number} from Redis.")
-                        except Exception as redis_err:
-                            log_message("system", f"Warning: Failed to fetch state for {phone_number} from Redis: {redis_err}")
+                    prompt_to_evaluate = new_turn_tokens
 
-                    if convo_file and convo_file.exists():
-                        try:
-                            log_message("system", f"Loading conversation history object: {convo_file.name}")
-                            with open(convo_file, "rb") as f:
-                                customer_obj = pickle.load(f)
-                                
-                            if isinstance(customer_obj, dict) and "state" in customer_obj:
-                                llm.load_state(customer_obj["state"])
-                                convo_tokens = customer_obj.get("tokens", [])
-                                history = customer_obj.get("history", [])
-                                msg_count = customer_obj.get("msg_count", 0)
-                                loaded_convo = True
-                            else:
-                                # Fallback or migration from old payload formats
-                                llm.load_state(customer_obj)
-                                convo_tokens = []
-                                history = []
-                                msg_count = 0
-                                loaded_convo = True
-                        except Exception as e:
-                            log_message("system", f"Warning: Failed to restore conversation history: {e}")
-                    
-                    if not loaded_convo:
-                        if loaded_global and global_cache_state:
-                            llm.load_state(global_cache_state)
-                            log_message("system", f"New user context: Initialized with {global_cache_file.name}")
-                        else:
-                            llm.reset()
-                            log_message("system", "No client global cache or conversation history, running from scratch.")
-                    
-                    # 3. Format prompt turn in ChatML layout with think pre-fill
-                    new_turn_text = f"\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                    new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
-                    
-                    # Determine target token list evaluated so far in the cache
-                    evaluated_tokens = convo_tokens if loaded_convo else prefix_tokens
-                    all_tokens = evaluated_tokens + new_turn_tokens
-                    
-                    # Set current evaluation index inside the context cache
-                    match_len = len(evaluated_tokens)
-                    if match_len > 0 and all_tokens[:match_len] == evaluated_tokens:
-                        llm.n_tokens = match_len
-                        log_message("system", f"Recycling KV cache: Preserving {match_len} prefix tokens. Appending {len(new_turn_tokens)} suffix tokens.")
+                    # Active RAM shortcut: If same phone number is already active in RAM, skip disk reload completely!
+                    if phone_number and _active_phone_number == phone_number and llm.n_tokens > 0:
+                        log_message("system", f"Phone {phone_number} active in RAM ({llm.n_tokens} tokens). Appending {len(new_turn_tokens)} suffix tokens.")
+                        if convo_file and convo_file.exists():
+                            try:
+                                with open(convo_file, "rb") as f:
+                                    customer_obj = pickle.load(f)
+                                if isinstance(customer_obj, dict):
+                                    history = customer_obj.get("history", [])
+                                    msg_count = customer_obj.get("msg_count", 0)
+                                    convo_tokens = customer_obj.get("tokens", [])
+                            except Exception:
+                                pass
                     else:
-                        llm.reset()
-                        log_message("system", f"Fresh context run: Evaluating all {len(all_tokens)} tokens.")
+                        # 1. Load Client Global Cache first (pre-compiled prefix)
+                        global_cache_file = global_cache_dir / f"{client_id}_global.bin" if client_id else None
+                        if global_cache_file and not global_cache_file.exists():
+                            global_cache_file = global_cache_dir / f"{client_id}.bin"
+                        
+                        loaded_global = False
+                        prefix_tokens = []
+                        global_cache_state = None
+                        
+                        if global_cache_file and global_cache_file.exists():
+                            try:
+                                log_message("system", f"Restoring client global cache: {global_cache_file.name}")
+                                with open(global_cache_file, "rb") as f:
+                                    payload_obj = pickle.load(f)
+                                
+                                if isinstance(payload_obj, dict) and "state" in payload_obj:
+                                    global_cache_state = payload_obj["state"]
+                                    prefix_tokens = payload_obj.get("tokens", [])
+                                else:
+                                    global_cache_state = payload_obj
+                                    prefix_tokens = []
+                                    
+                                loaded_global = True
+                            except Exception as e:
+                                log_message("system", f"Warning: Failed to load global cache: {e}")
+                        
+                        # 2. Load User Convo History cache from phonenumber_phone.bin
+                        loaded_convo = False
+                        if convo_file and not convo_file.exists() and phone_number and loaded_global:
+                            org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
+                            try:
+                                res_dns = requests.get(f"https://raw.githubusercontent.com/{org}/dns/main/config.json", timeout=5)
+                                if res_dns.status_code == 200:
+                                    redis_url = res_dns.json().get("redis-worker", {}).get("active")
+                                    if redis_url:
+                                        log_message("system", f"Local convo cache missing. Querying active Redis for state:{phone_number}...")
+                                        res_redis = requests.get(f"{redis_url.rstrip('/')}/get?key=state:{phone_number}", timeout=10)
+                                        if res_redis.status_code == 200:
+                                            payload = res_redis.json().get("value", "")
+                                            if payload:
+                                                import gzip
+                                                compressed_bytes = base64.b64decode(payload)
+                                                decompressed = gzip.decompress(compressed_bytes)
+                                                with open(convo_file, "wb") as f:
+                                                    f.write(decompressed)
+                                                log_message("system", f"Successfully hydrated convo cache for {phone_number} from Redis.")
+                            except Exception as redis_err:
+                                log_message("system", f"Warning: Failed to fetch state for {phone_number} from Redis: {redis_err}")
+
+                        if convo_file and convo_file.exists():
+                            try:
+                                log_message("system", f"Loading conversation history object: {convo_file.name}")
+                                with open(convo_file, "rb") as f:
+                                    customer_obj = pickle.load(f)
+                                    
+                                if isinstance(customer_obj, dict) and "state" in customer_obj:
+                                    llm.load_state(customer_obj["state"])
+                                    convo_tokens = customer_obj.get("tokens", [])
+                                    history = customer_obj.get("history", [])
+                                    msg_count = customer_obj.get("msg_count", 0)
+                                    loaded_convo = True
+                                else:
+                                    llm.load_state(customer_obj)
+                                    convo_tokens = []
+                                    history = []
+                                    msg_count = 0
+                                    loaded_convo = True
+                            except Exception as e:
+                                log_message("system", f"Warning: Failed to restore conversation history: {e}")
+                        
+                        if not loaded_convo:
+                            if loaded_global and global_cache_state:
+                                llm.load_state(global_cache_state)
+                                convo_tokens = prefix_tokens
+                                log_message("system", f"New user context: Initialized with {global_cache_file.name}")
+                            else:
+                                llm.reset()
+                                convo_tokens = []
+                                log_message("system", "No client global cache or conversation history, running from scratch.")
+                                
+                        _active_phone_number = phone_number
+                        
+                        # When loading state, pass only incremental turn tokens if KV state is loaded
+                        if llm.n_tokens > 0:
+                            prompt_to_evaluate = new_turn_tokens
+                        else:
+                            prompt_to_evaluate = convo_tokens + new_turn_tokens
 
                     # Apply logit_bias to ban thought tokens and suppress <stop> token
                     logit_bias = {}
@@ -284,7 +278,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                         pass
 
                     completion_generator = llm.create_completion(
-                        prompt=all_tokens,
+                        prompt=prompt_to_evaluate,
                         max_tokens=512,
                         stream=True,
                         temperature=0.7,
@@ -334,7 +328,7 @@ async def run_model_query(prompt: str, client_id: Optional[str] = None, phone_nu
                             msg_count += 2
                             
                             state_obj = llm.save_state()
-                            full_tokens = all_tokens + llm.tokenize(text_result.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
+                            full_tokens = convo_tokens + new_turn_tokens + llm.tokenize(text_result.encode("utf-8")) + llm.tokenize(b"<|im_end|>\n")
                             
                             customer_obj = {
                                 "phone_number": phone_number,
