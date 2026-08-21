@@ -194,13 +194,12 @@ async def run_model_query(
                         log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
 
                         # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
-                        # Stop tokens for Qwen ChatML
+                        # Stop tokens for Qwen ChatML (including malformed tags)
                         stop_token_ids = set()
-                        for s_str in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
+                        for s_str in ["<|im_end|>", "<|im_start|>", "</|im_start|>", "<|endoftext|>"]:
                             try:
                                 s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False, special=True)
-                                if len(s_toks) == 1:
-                                    stop_token_ids.update(s_toks)
+                                stop_token_ids.update(s_toks)
                             except Exception:
                                 pass
                         try:
@@ -227,27 +226,23 @@ async def run_model_query(
                             )
                             if token_id in stop_token_ids:
                                 log_message("debug", f"Reached stop token ID: {token_id} at step {step}")
+                                # Evaluate the stop token to cleanly end the turn in KV cache
+                                llm.eval([token_id])
                                 break
 
                             piece_str = llm.detokenize([token_id]).decode("utf-8", errors="ignore")
                             text_result_chunks.append(piece_str)
                             llm.eval([token_id])
 
-                        # Properly close the assistant turn in the KV cache so subsequent turns append cleanly
-                        try:
-                            close_turn_toks = llm.tokenize("<|im_end|>\n".encode("utf-8"), add_bos=False, special=True)
-                            llm.eval(close_turn_toks)
-                            log_message("debug", f"Closed assistant turn in KV cache with <|im_end|>\n (n_tokens={llm.n_tokens})")
-                        except Exception as close_err:
-                            log_message("debug", f"Warning closing turn in KV cache: {close_err}")
-
                         raw_text = "".join(text_result_chunks)
                         log_message("debug", f"Raw Generated Text ({len(raw_text)} chars): {repr(raw_text)}")
 
-
                         # Strip <think>...</think> reasoning blocks cleanly
                         cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text, flags=re.IGNORECASE)
-                        cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', cleaned_text)[0]
+                        # Split on any variant of ChatML tag (including </|im_start|>, <|im_start|>, <|im_end|>)
+                        cleaned_text = re.split(r'</?\|?im_(?:start|end)[\|>\}]?', cleaned_text, flags=re.IGNORECASE)[0]
+                        cleaned_text = re.split(r'<\|[a-zA-Z0-9_|]+\|>', cleaned_text)[0]
+
 
 
 
