@@ -7,7 +7,7 @@ from model.cache_manager import (
     STATES_DIR,
     GLOBAL_CACHE_DIR,
 )
-from model.query_processor import run_model_query
+from model.query_processor import run_model_query, ensure_input_ids_capacity
 from model.rebuilder import queue_global_rebuild
 from model.lifecycle import run_3_45_lifecycle_timer
 
@@ -15,6 +15,7 @@ MODEL_CODE = "0bm"
 
 __all__ = [
     "run_model_query",
+    "ensure_input_ids_capacity",
     "get_llm",
     "log_message",
     "save_state_bg",
@@ -27,4 +28,5 @@ __all__ = [
     "run_3_45_lifecycle_timer",
     "MODEL_CODE"
 ]
+
 
