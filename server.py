@@ -103,7 +103,7 @@ def extract_customer_summary(customer_key: str, state_file_path: Path) -> str:
         "<|im_start|>user\n"
         "Summarize all key customer details, name, preferences, budget, "
         "and active inquiries from this conversation in 100-150 words:<|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
     llm = get_llm()
     with _eval_lock:
@@ -119,23 +119,35 @@ def extract_customer_summary(customer_key: str, state_file_path: Path) -> str:
             else:
                 return ""
 
-            summary_tokens = llm.tokenize(summary_prompt_text.encode("utf-8"))
-            chunks: List[str] = []
-            comp_gen = llm.create_completion(
-                prompt=summary_tokens,
-                max_tokens=256,
-                stream=True,
-                stop=["<|im_end|>", "<|im_start|>"]
-            )
-            for chunk in comp_gen:
-                chunks.append(chunk["choices"][0]["text"])
+            ensure_input_ids_capacity(llm)
+            summary_tokens = llm.tokenize(summary_prompt_text.encode("utf-8"), add_bos=False)
+            llm.eval(summary_tokens)
 
-            raw_summary: str = "".join(chunks).strip()
-            cleaned_summary: str = re.split(r'<\|im_(?:start|end)[\|>\}]?', raw_summary)[0].strip()
-            return cleaned_summary
+            stop_token_ids = set()
+            for s_str in ["<|im_end|>", "<|im_start|>", "</|im_start|>", "<|endoftext|>"]:
+                try:
+                    s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False, special=True)
+                    stop_token_ids.update(s_toks)
+                except Exception:
+                    pass
+
+            text_chunks: List[str] = []
+            for step in range(200):
+                tok_id = llm.sample(temp=0.7, top_k=40, top_p=0.9)
+                if tok_id in stop_token_ids:
+                    break
+                piece = llm.detokenize([tok_id]).decode("utf-8", errors="ignore")
+                text_chunks.append(piece)
+                llm.eval([tok_id])
+
+            raw_summary: str = "".join(text_chunks).strip()
+            cleaned_summary: str = re.sub(r'<think>[\s\S]*?</think>', '', raw_summary, flags=re.IGNORECASE)
+            cleaned_summary = re.split(r'</?\|?im_(?:start|end)[\|>\}]?', cleaned_summary, flags=re.IGNORECASE)[0].strip()
+            return cleaned_summary or f"Customer {customer_key} active conversation session."
         except Exception as ex:
             log_message("summary", f"Error summarizing customer {customer_key}: {ex}")
             return f"Customer {customer_key} active conversation session."
+
 
 def prefill_and_save_kv_state(
     customer_key: str,
@@ -466,12 +478,15 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
 @app.post("/v1/summarize")
 def summarize_all_active_states(req: SummarizeRequest) -> Dict[str, Any]:
     """
-    Extracts 100-150 word customer summaries from all active .bin states.
+    Extracts 100-150 word customer summaries from all active .bin states in RAM LRU & Disk.
     """
-    state_files: List[Path] = list(STATES_DIR.glob("*.bin"))
+    all_keys: set[str] = set(_ram_states_cache.keys())
+    for pfile in STATES_DIR.glob("*.bin"):
+        all_keys.add(pfile.stem)
+
     results: Dict[str, str] = {}
-    for pfile in state_files:
-        ckey = pfile.stem
+    for ckey in all_keys:
+        pfile = STATES_DIR / f"{ckey}.bin"
         summ = extract_customer_summary(ckey, pfile)
         if summ:
             results[ckey] = summ
@@ -479,6 +494,7 @@ def summarize_all_active_states(req: SummarizeRequest) -> Dict[str, Any]:
         "total_customers": len(results),
         "summaries": results
     }
+
 
 @app.post("/v1/global-update")
 def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTasks) -> Dict[str, Any]:
