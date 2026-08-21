@@ -233,8 +233,17 @@ async def run_model_query(
                             text_result_chunks.append(piece_str)
                             llm.eval([token_id])
 
+                        # Properly close the assistant turn in the KV cache so subsequent turns append cleanly
+                        try:
+                            close_turn_toks = llm.tokenize("<|im_end|>\n".encode("utf-8"), add_bos=False, special=True)
+                            llm.eval(close_turn_toks)
+                            log_message("debug", f"Closed assistant turn in KV cache with <|im_end|>\n (n_tokens={llm.n_tokens})")
+                        except Exception as close_err:
+                            log_message("debug", f"Warning closing turn in KV cache: {close_err}")
+
                         raw_text = "".join(text_result_chunks)
                         log_message("debug", f"Raw Generated Text ({len(raw_text)} chars): {repr(raw_text)}")
+
 
                         # Strip <think>...</think> reasoning blocks cleanly
                         cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text, flags=re.IGNORECASE)
