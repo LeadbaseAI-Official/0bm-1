@@ -130,4 +130,39 @@ def upload_states_to_huggingface(model_id: str = "default") -> bool:
         log_message("system", f"[HF Sync] Warning: Hugging Face upload failed: {err}")
         return False
 
+def clear_huggingface_and_local_states(model_id: str = "default") -> bool:
+    """
+    Clears local RAM & disk states and deletes remote HF dataset files for model_id
+    when a new global KV state update is received from kv_worker.
+    """
+    _ram_states_cache.clear()
+    
+    for bin_file in STATES_DIR.glob("*.bin"):
+        try:
+            bin_file.unlink()
+        except Exception:
+            pass
+
+    token: str = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN") or os.getenv("GITHUB_PAT") or ""
+    if not token:
+        log_message("system", "[HF Clear] No HF_TOKEN provided. Cleared local states only.")
+        return True
+
+    log_message("system", f"[HF Clear] Deleting remote HF dataset files for model '{model_id}'...")
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        api.delete_folder(
+            path_in_repo=f"models/{model_id}",
+            repo_id=HF_REPO_ID,
+            repo_type="dataset",
+            commit_message=f"Clear outdated states for model {model_id} upon global KV update"
+        )
+        log_message("system", f"[HF Clear] Successfully cleared remote HF dataset files for model '{model_id}'.")
+        return True
+    except Exception as err:
+        log_message("system", f"[HF Clear] Warning: Hugging Face folder delete note: {err}")
+        return False
+
+
 
