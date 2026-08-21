@@ -3,6 +3,7 @@ import re
 import pickle
 import asyncio
 import threading
+import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -18,6 +19,23 @@ MAX_HISTORY = 200
 
 _jid_locks: Dict[str, asyncio.Lock] = {}
 _jid_locks_guard = asyncio.Lock()
+
+def ensure_input_ids_capacity(llm: Any) -> None:
+    """
+    Resizes llm.input_ids NumPy array after loading a compact state file
+    so it has full context capacity for incoming conversation turns.
+    """
+    try:
+        target_capacity: int = llm.n_ctx()
+        current_len: int = len(llm.input_ids)
+        if current_len < target_capacity:
+            log_message("debug", f"Auto-expanding llm.input_ids from {current_len} to full model context capacity ({target_capacity})...")
+            new_arr = np.zeros(target_capacity, dtype=np.int32)
+            new_arr[:current_len] = llm.input_ids
+            llm.input_ids = new_arr
+    except Exception as err:
+        log_message("debug", f"Warning: Failed to expand llm.input_ids capacity: {err}")
+
 
 async def get_jid_lock(jid_key: str) -> asyncio.Lock:
     """Retrieves or creates a per-JID asyncio Lock to enforce sequential request processing per user."""
@@ -94,6 +112,7 @@ async def run_model_query(
                             ram_obj = _ram_states_cache[customer_key]
                             _ram_states_cache.move_to_end(customer_key)
                             llm.load_state(ram_obj["state"])
+                            ensure_input_ids_capacity(llm)
                             history = ram_obj.get("history", [])
                             msg_count = ram_obj.get("msg_count", 0)
                             loaded_convo = True
@@ -108,6 +127,7 @@ async def run_model_query(
                                         customer_obj = pickle.load(f)
                                     if isinstance(customer_obj, dict) and "state" in customer_obj:
                                         llm.load_state(customer_obj["state"])
+                                        ensure_input_ids_capacity(llm)
                                         history = customer_obj.get("history", [])
                                         msg_count = customer_obj.get("msg_count", 0)
                                         loaded_convo = True
@@ -140,9 +160,10 @@ async def run_model_query(
 
                                 global_tokens: List[int] = []
                                 if loaded_global and global_cache_state:
-
                                     llm.load_state(global_cache_state)
+                                    ensure_input_ids_capacity(llm)
                                     log_message("debug", f"STEP 4: Initialized from GLOBAL_SEED (n_tokens={llm.n_tokens})")
+
                                     if isinstance(payload_obj, dict) and "tokens" in payload_obj:
                                         global_tokens = payload_obj["tokens"]
                                         log_message("debug", f"═════════════════ GLOBAL SEED TOKEN DUMP (Total: {len(global_tokens)}) ═════════════════")
