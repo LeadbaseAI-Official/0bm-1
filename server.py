@@ -44,6 +44,44 @@ class GlobalUpdateItem(BaseModel):
     client_id: Optional[str] = None
     state_bytes_base64: str
 
+def send_ready_signal_to_agent0(client_id: str) -> bool:
+    """
+    Dispatches completion READY signal directly from 0bm runner back to Agent-0 server.
+    Hardcoded candidate URLs: Production placeholder first, falling back to local dev Cloudflare Tunnel.
+    """
+    candidate_urls: List[str] = [
+        os.getenv("PRODUCTION_AGENT0_URL", "https://placeholder-production-domain.com").strip(),
+        os.getenv("AGENT0_WEBHOOK_URL", "https://brother-review-attachments-satisfactory.trycloudflare.com/api/knowledge/kv-complete").strip()
+    ]
+    
+    payload: Dict[str, Any] = {
+        "client_id": client_id,
+        "status": "ready"
+    }
+
+    for base_url in candidate_urls:
+        if not base_url or "placeholder" in base_url:
+            continue
+            
+        target_endpoint: str = base_url if base_url.endswith("/kv-complete") else f"{base_url.rstrip('/')}/api/knowledge/kv-complete"
+        log_message("SIGNAL", f"📡 Dispatching READY signal for client '{client_id}' to Agent-0 at '{target_endpoint}'...")
+        try:
+            res = requests.post(target_endpoint, json=payload, timeout=15)
+            if res.status_code == 200:
+                log_message("SIGNAL", f"✅ READY signal accepted by Agent-0 (HTTP 200) for client '{client_id}'.")
+                return True
+            else:
+                log_message("SIGNAL", f"⚠️ Agent-0 at '{target_endpoint}' returned HTTP {res.status_code}. Trying next URL...")
+        except Exception as err:
+            log_message("SIGNAL", f"⚠️ Failed to reach Agent-0 at '{target_endpoint}': {err}")
+
+    log_message("SIGNAL", f"❌ All candidate Agent-0 webhook URLs failed for client '{client_id}'.")
+    return False
+
+
+
+
+
 
 class SummarizeRequest(BaseModel):
     client_id: Optional[str] = None
@@ -441,15 +479,17 @@ def summarize_all_active_states(req: SummarizeRequest) -> Dict[str, Any]:
     }
 
 @app.post("/v1/global-update")
-def receive_global_update(req: GlobalUpdateItem) -> Dict[str, Any]:
+def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """
     Receives compiled binary KV state from kv_worker, decompresses it,
-    saves to GLOBAL_CACHE_DIR / "global.bin", and triggers background KV rebuild.
+    saves to GLOBAL_CACHE_DIR / "global.bin", triggers background KV rebuild,
+    and dispatches ready signal to Agent-0 server.
     """
     try:
-        c_id = req.client_id or "unknown"
+        c_id: str = req.client_id or "default"
+        
         print("\n" + "═" * 65, flush=True)
-        log_message("GLOBAL_UPDATE", f"📥 RECEIVED COMPILED KV STATE FROM KV_WORKER for client_id='{c_id}'")
+        log_message("GLOBAL_UPDATE", f"📥 RECEIVED COMPILED KV STATE for client_id='{c_id}'")
         log_message("GLOBAL_UPDATE", f"   Base64 Payload Size: {len(req.state_bytes_base64)} chars")
         print("═" * 65, flush=True)
         
@@ -474,6 +514,9 @@ def receive_global_update(req: GlobalUpdateItem) -> Dict[str, Any]:
             queue_global_rebuild(state_data, tokens_data)
             log_message("GLOBAL_UPDATE", f"✅ Successfully queued global KV cache rebuild for client '{c_id}'!")
             
+        # Dispatch READY completion signal from 0bm runner back to Agent-0
+        background_tasks.add_task(send_ready_signal_to_agent0, c_id)
+            
         print("═" * 65 + "\n", flush=True)
         return {"status": "success", "client_id": c_id, "state_size_bytes": len(raw_bytes)}
     except Exception as ex:
@@ -481,6 +524,8 @@ def receive_global_update(req: GlobalUpdateItem) -> Dict[str, Any]:
         traceback.print_exc()
         log_message("GLOBAL_UPDATE", f"❌ Failed to process received KV state update: {ex}")
         raise HTTPException(status_code=500, detail=f"Global update failed: {str(ex)}")
+
+
 
 
 @app.post("/v1/chat/clear")
