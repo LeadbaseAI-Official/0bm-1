@@ -214,10 +214,19 @@ async def run_model_query(
                         stop_token_ids = set()
                         for s_str in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
                             try:
-                                s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False)
-                                stop_token_ids.update(s_toks)
+                                s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False, special=True)
+                                if len(s_toks) == 1:
+                                    stop_token_ids.update(s_toks)
                             except Exception:
                                 pass
+                        try:
+                            eos_id = llm.token_eos()
+                            if eos_id is not None:
+                                stop_token_ids.add(eos_id)
+                        except Exception:
+                            pass
+                        log_message("debug", f"Configured stop token IDs: {stop_token_ids}")
+
 
                         start_n: int = llm.n_tokens
                         log_message("debug", f"Evaluating {len(new_turn_tokens)} new turn tokens starting at n_tokens={start_n}...")
