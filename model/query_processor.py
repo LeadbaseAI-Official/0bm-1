@@ -138,8 +138,9 @@ async def run_model_query(
                                     except Exception as e:
                                         log_message("debug", f"STEP 4: Global seed load failed: {e}")
 
-                                 global_tokens: List[int] = []
+                                global_tokens: List[int] = []
                                 if loaded_global and global_cache_state:
+
                                     llm.load_state(global_cache_state)
                                     log_message("debug", f"STEP 4: Initialized from GLOBAL_SEED (n_tokens={llm.n_tokens})")
                                     if isinstance(payload_obj, dict) and "tokens" in payload_obj:
