@@ -170,7 +170,7 @@ async def run_model_query(
                         log_message("debug", f"Current LLM State n_tokens before generate: {llm.n_tokens}")
                         log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
 
-                        # ─── STEP 5: Direct Incremental Streaming LLM Evaluation ───
+                        # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
                         # Suppress reasoning <think> tokens via logit_bias (-100.0)
                         logit_bias: Dict[int, float] = {}
                         try:
@@ -181,19 +181,41 @@ async def run_model_query(
                         except Exception as tb_err:
                             log_message("debug", f"Could not calculate think token logit_bias: {tb_err}")
 
-                        text_result_chunks = []
-                        comp_gen = llm.create_completion(
-                            prompt=new_turn_tokens, max_tokens=512, stream=True,
-                            temperature=0.7, top_k=40, top_p=0.9,
-                            logit_bias=logit_bias,
-                            stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
-                        )
+                        # Stop tokens for Qwen ChatML
+                        stop_token_ids = set()
+                        for s_str in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
+                            try:
+                                s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False)
+                                stop_token_ids.update(s_toks)
+                            except Exception:
+                                pass
 
-                        for chunk in comp_gen:
-                            text_result_chunks.append(chunk["choices"][0]["text"])
+                        start_n: int = llm.n_tokens
+                        log_message("debug", f"Evaluating {len(new_turn_tokens)} new turn tokens starting at n_tokens={start_n}...")
+                        llm.eval(new_turn_tokens)
+                        log_message("debug", f"✅ Evaluated new turn tokens. Updated n_tokens={llm.n_tokens}")
+
+                        text_result_chunks: List[str] = []
+                        max_new_tokens: int = 512
+
+                        for step in range(max_new_tokens):
+                            token_id = llm.sample(
+                                temp=0.7,
+                                top_k=40,
+                                top_p=0.9,
+                                logit_bias=logit_bias
+                            )
+                            if token_id in stop_token_ids:
+                                log_message("debug", f"Reached stop token ID: {token_id} at step {step}")
+                                break
+
+                            piece_str = llm.detokenize([token_id]).decode("utf-8", errors="ignore")
+                            text_result_chunks.append(piece_str)
+                            llm.eval([token_id])
 
                         raw_text = "".join(text_result_chunks)
                         cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', raw_text)[0]
+
 
                         abandon_token: Optional[str] = None
                         abandon_match = re.search(r'<abandon>(.*?)</abandon>', cleaned_text, re.IGNORECASE | re.DOTALL)
