@@ -192,15 +192,23 @@ async def run_model_query(
                         log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
 
                         # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
-                        # Suppress reasoning <think> tokens via logit_bias (-100.0)
-                        logit_bias: Dict[int, float] = {}
+                        # Suppress reasoning <think> tokens via LogitsProcessorList
+                        from llama_cpp import LogitsProcessorList
+
+                        think_toks: List[int] = []
                         try:
                             think_toks = llm.tokenize("<think>".encode("utf-8"), add_bos=False)
-                            for t in think_toks:
-                                logit_bias[t] = -100.0
-                            log_message("debug", f"Suppressed reasoning tokens: {think_toks}")
+                            log_message("debug", f"Suppressed reasoning token IDs: {think_toks}")
                         except Exception as tb_err:
-                            log_message("debug", f"Could not calculate think token logit_bias: {tb_err}")
+                            log_message("debug", f"Could not calculate think token IDs: {tb_err}")
+
+                        def suppress_think_logits_processor(input_ids_arr: np.ndarray, logits_arr: np.ndarray) -> np.ndarray:
+                            for t in think_toks:
+                                if t < len(logits_arr):
+                                    logits_arr[t] = -1000.0
+                            return logits_arr
+
+                        logits_processors = LogitsProcessorList([suppress_think_logits_processor]) if think_toks else None
 
                         # Stop tokens for Qwen ChatML
                         stop_token_ids = set()
@@ -224,7 +232,7 @@ async def run_model_query(
                                 temp=0.7,
                                 top_k=40,
                                 top_p=0.9,
-                                logit_bias=logit_bias
+                                logits_processor=logits_processors
                             )
                             if token_id in stop_token_ids:
                                 log_message("debug", f"Reached stop token ID: {token_id} at step {step}")
@@ -233,6 +241,7 @@ async def run_model_query(
                             piece_str = llm.detokenize([token_id]).decode("utf-8", errors="ignore")
                             text_result_chunks.append(piece_str)
                             llm.eval([token_id])
+
 
                         raw_text = "".join(text_result_chunks)
                         cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', raw_text)[0]
