@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+requests
+PyGithub
+pynacl
+llama-cpp-python
+huggingface_hub
+redis
