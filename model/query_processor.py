@@ -1,0 +1,211 @@
+import os
+import re
+import pickle
+import asyncio
+import threading
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+
+from model.engine import (
+    get_llm, log_message, PARALLEL_SLOTS, _eval_lock, _concurrency_semaphore
+)
+from model.cache_manager import (
+    _ram_states_cache, RAM_CACHE_CAPACITY, STATES_DIR, GLOBAL_CACHE_DIR, save_state_bg
+)
+from model.rebuilder import is_model_rebuilding
+
+MAX_HISTORY = 200
+
+_jid_locks: Dict[str, asyncio.Lock] = {}
+_jid_locks_guard = asyncio.Lock()
+
+async def get_jid_lock(jid_key: str) -> asyncio.Lock:
+    """Retrieves or creates a per-JID asyncio Lock to enforce sequential request processing per user."""
+    async with _jid_locks_guard:
+        if jid_key not in _jid_locks:
+            _jid_locks[jid_key] = asyncio.Lock()
+        return _jid_locks[jid_key]
+
+async def run_model_query(
+    prompt: str,
+    phone_number: Optional[str] = None,
+    clean_number: Optional[str] = None,
+    jid: Optional[str] = None,
+    image_base64: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Evaluates an incoming prompt against the Llama model using 3-slot concurrency
+    and per-JID sequential locking for KV state consistency.
+    """
+    global _concurrency_semaphore
+    if _concurrency_semaphore is None:
+        _concurrency_semaphore = asyncio.Semaphore(PARALLEL_SLOTS)
+
+    # Determine primary customer key (e.g. cleanNumber, phone_number, or JID)
+    customer_key: str = clean_number or phone_number or jid or "default"
+    jid_lock = await get_jid_lock(customer_key)
+
+    # Enforce sequential execution per customer_key while allowing 3-slot slot parallelism
+    async with jid_lock:
+        async with _concurrency_semaphore:
+            def evaluate_query() -> Dict[str, Any]:
+                nonlocal prompt, image_base64
+                global _ram_states_cache
+                with _eval_lock:
+                    try:
+                        llm = get_llm()
+                        log_message("debug", f"═══════════════════════════════════════════════════════════")
+                        log_message("debug", f"INCOMING REQUEST: customer_key={customer_key}")
+                        log_message("debug", f"  prompt        = {repr(prompt[:100])}{'...' if len(prompt) > 100 else ''}")
+                        log_message("debug", f"  RAM cache     = {list(_ram_states_cache.keys())} ({len(_ram_states_cache)}/{RAM_CACHE_CAPACITY})")
+                        log_message("debug", f"═══════════════════════════════════════════════════════════")
+
+                        # Check if global prompt is actively undergoing KV cache rebuild
+                        if is_model_rebuilding():
+                            log_message("debug", "Global KV cache rebuild in progress. Temporarily holding query.")
+                            return {"response": "System maintenance in progress. Please try again shortly.", "abandon_token": None}
+
+                        # Vision mode handling
+                        if image_base64 and getattr(llm, "chat_handler", None) is not None:
+                            log_message("system", f"Running vision query with image size {len(image_base64)} chars")
+                            if not image_base64.startswith("data:image"):
+                                image_base64 = f"data:image/jpeg;base64,{image_base64}"
+                            res_gen = llm.create_chat_completion(
+                                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": image_base64}}]}],
+                                max_tokens=512, stream=True
+                            )
+                            chunks = [c["choices"][0]["delta"]["content"] for c in res_gen if "content" in c["choices"][0]["delta"]]
+                            text_res = "".join(chunks)
+                            return {"response": text_res, "abandon_token": None}
+                        elif image_base64:
+                            prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
+
+                        # ─── STEP 1: Qwen ChatML Turn Tokenization ───
+                        new_turn_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                        new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
+
+                        convo_file = STATES_DIR / f"{customer_key}.bin"
+                        history: List[Dict[str, str]] = []
+                        msg_count: int = 0
+                        loaded_convo: bool = False
+
+                        # ─── STEP 2: Level-1 RAM LRU Cache ───
+                        if customer_key in _ram_states_cache:
+                            ram_obj = _ram_states_cache[customer_key]
+                            _ram_states_cache.move_to_end(customer_key)
+                            llm.load_state(ram_obj["state"])
+                            history = ram_obj.get("history", [])
+                            msg_count = ram_obj.get("msg_count", 0)
+                            loaded_convo = True
+                            log_message("debug", f"STEP 2: RAM LRU HIT ✓ (n_tokens={llm.n_tokens})")
+                        else:
+                            log_message("debug", f"STEP 2: RAM LRU MISS ✗ for {customer_key}")
+
+                            # ─── STEP 3: Level-2 Local NVMe Disk Cache ───
+                            if convo_file.exists():
+                                try:
+                                    with open(convo_file, "rb") as f:
+                                        customer_obj = pickle.load(f)
+                                    if isinstance(customer_obj, dict) and "state" in customer_obj:
+                                        llm.load_state(customer_obj["state"])
+                                        history = customer_obj.get("history", [])
+                                        msg_count = customer_obj.get("msg_count", 0)
+                                        loaded_convo = True
+                                        log_message("debug", f"STEP 3: DISK HIT ✓ (n_tokens={llm.n_tokens})")
+                                except Exception as e:
+                                    log_message("debug", f"STEP 3: DISK FAILED ✗: {e}")
+
+                            # ─── STEP 4: Global Seed Fallback ───
+                            if not loaded_convo:
+                                global_cache_file = GLOBAL_CACHE_DIR / "global.bin"
+                                if not global_cache_file.exists():
+                                    global_files = list(GLOBAL_CACHE_DIR.glob("*.bin"))
+                                    if global_files:
+                                        global_cache_file = global_files[0]
+
+                                loaded_global = False
+                                global_cache_state = None
+
+                                if global_cache_file and global_cache_file.exists():
+                                    try:
+                                        with open(global_cache_file, "rb") as f:
+                                            payload_obj = pickle.load(f)
+                                        if isinstance(payload_obj, dict) and "state" in payload_obj:
+                                            global_cache_state = payload_obj["state"]
+                                        else:
+                                            global_cache_state = payload_obj
+                                        loaded_global = True
+                                    except Exception as e:
+                                        log_message("debug", f"STEP 4: Global seed load failed: {e}")
+
+                                if loaded_global and global_cache_state:
+                                    llm.load_state(global_cache_state)
+                                    log_message("debug", f"STEP 4: Initialized from GLOBAL_SEED (n_tokens={llm.n_tokens})")
+                                else:
+                                    log_message("debug", "STEP 4: UNCONFIGURED MODEL FALLBACK")
+                                    return {
+                                        "response": "Sorry, I cannot process this request since the model is not configured.",
+                                        "abandon_token": None
+                                    }
+
+                        # ─── STEP 5: Direct Incremental Streaming LLM Evaluation ───
+                        text_result_chunks = []
+                        comp_gen = llm.create_completion(
+                            prompt=new_turn_tokens, max_tokens=512, stream=True,
+                            temperature=0.7, top_k=40, top_p=0.9,
+                            stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+                        )
+                        for chunk in comp_gen:
+                            text_result_chunks.append(chunk["choices"][0]["text"])
+
+                        raw_text = "".join(text_result_chunks)
+                        cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', raw_text)[0]
+
+                        abandon_token: Optional[str] = None
+                        abandon_match = re.search(r'<abandon>(.*?)</abandon>', cleaned_text, re.IGNORECASE | re.DOTALL)
+                        if abandon_match:
+                            abandon_token = abandon_match.group(1).strip()
+                        cleaned_text = re.sub(r'<abandon>[\s\S]*?</abandon>', '', cleaned_text, flags=re.IGNORECASE)
+                        text_result = cleaned_text.strip()
+
+                        log_message("response", f"{text_result}{' [ABANDON:' + abandon_token + ']' if abandon_token else ''}")
+
+                        # ─── STEP 6: Save State to RAM LRU & Disk ───
+                        try:
+                            history.append({"role": "user", "content": prompt})
+                            history.append({"role": "assistant", "content": text_result})
+                            msg_count += 2
+                            state_obj = llm.save_state()
+                            actual_n = llm.n_tokens
+                            full_tokens = llm.input_ids.tolist()[:actual_n]
+
+                            customer_obj = {
+                                "customer_key": customer_key,
+                                "state": state_obj,
+                                "tokens": full_tokens,
+                                "history": history,
+                                "msg_count": msg_count
+                            }
+
+                            _ram_states_cache[customer_key] = customer_obj
+                            _ram_states_cache.move_to_end(customer_key)
+                            
+                            # Level-1 RAM Eviction -> Level-2 NVMe Disk
+                            if len(_ram_states_cache) > RAM_CACHE_CAPACITY:
+                                evicted_key, evicted_obj = _ram_states_cache.popitem(last=False)
+                                evicted_file = STATES_DIR / f"{evicted_key}.bin"
+                                save_state_bg(evicted_file, evicted_obj)
+
+                            if msg_count >= MAX_HISTORY:
+                                abandon_token = "MAX_LIMIT_REACHED"
+                        except Exception as save_err:
+                            log_message("debug", f"STEP 6: SAVE FAILED ✗: {save_err}")
+
+                        return {"response": text_result, "abandon_token": abandon_token}
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        return {"response": f"Exception raised while running llama-cpp: {e}", "abandon_token": None}
+            return await asyncio.to_thread(evaluate_query)
+
+
