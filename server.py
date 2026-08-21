@@ -21,8 +21,10 @@ from model import (
     run_model_query, MODEL_CODE, log_message, get_llm,
     run_3_45_lifecycle_timer, queue_global_rebuild,
     download_states_from_huggingface, upload_states_to_huggingface,
+    clear_huggingface_and_local_states,
     STATES_DIR, GLOBAL_CACHE_DIR
 )
+
 from model.engine import _eval_lock
 from model.cache_manager import _ram_states_cache, save_state_bg
 from model.lifecycle import is_accepting_requests
@@ -509,6 +511,10 @@ def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTas
             gf.write(raw_bytes)
         log_message("GLOBAL_UPDATE", f"Saved global seed to disk: {global_file}")
         
+        repo_full: str = os.getenv("GITHUB_REPOSITORY", "")
+        repo_name: str = repo_full.split("/")[-1] if "/" in repo_full else "test"
+        clear_huggingface_and_local_states(repo_name)
+
         # Trigger background KV cache rebuild for active conversations
         if state_data:
             queue_global_rebuild(state_data, tokens_data)
@@ -516,6 +522,7 @@ def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTas
             
         # Dispatch READY completion signal from 0bm runner back to Agent-0
         background_tasks.add_task(send_ready_signal_to_agent0, c_id)
+
             
         print("═" * 65 + "\n", flush=True)
         return {"status": "success", "client_id": c_id, "state_size_bytes": len(raw_bytes)}
