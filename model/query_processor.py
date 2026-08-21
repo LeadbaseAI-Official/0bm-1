@@ -138,9 +138,20 @@ async def run_model_query(
                                     except Exception as e:
                                         log_message("debug", f"STEP 4: Global seed load failed: {e}")
 
+                                 global_tokens: List[int] = []
                                 if loaded_global and global_cache_state:
                                     llm.load_state(global_cache_state)
                                     log_message("debug", f"STEP 4: Initialized from GLOBAL_SEED (n_tokens={llm.n_tokens})")
+                                    if isinstance(payload_obj, dict) and "tokens" in payload_obj:
+                                        global_tokens = payload_obj["tokens"]
+                                        log_message("debug", f"═════════════════ GLOBAL SEED TOKEN DUMP (Total: {len(global_tokens)}) ═════════════════")
+                                        log_message("debug", f"Global Token IDs: {global_tokens}")
+                                        try:
+                                            decoded_global = [llm.detokenize([t]).decode("utf-8", errors="ignore") for t in global_tokens]
+                                            log_message("debug", f"Global Decoded Tokens: {decoded_global}")
+                                        except Exception as dt_err:
+                                            log_message("debug", f"Global detokenize err: {dt_err}")
+                                        log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
                                 else:
                                     log_message("debug", "STEP 4: UNCONFIGURED MODEL FALLBACK")
                                     return {
@@ -148,13 +159,35 @@ async def run_model_query(
                                         "abandon_token": None
                                     }
 
+                        log_message("debug", f"═════════════════ NEW TURN TOKEN DUMP (Total: {len(new_turn_tokens)}) ═════════════════")
+                        log_message("debug", f"New Turn Token IDs: {new_turn_tokens}")
+                        try:
+                            decoded_turn = [llm.detokenize([t]).decode("utf-8", errors="ignore") for t in new_turn_tokens]
+                            log_message("debug", f"New Turn Decoded Tokens: {decoded_turn}")
+                        except Exception as dt_err2:
+                            log_message("debug", f"New Turn detokenize err: {dt_err2}")
+                        log_message("debug", f"Current LLM State n_tokens before generate: {llm.n_tokens}")
+                        log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
+
                         # ─── STEP 5: Direct Incremental Streaming LLM Evaluation ───
+                        # Suppress reasoning <think> tokens via logit_bias (-100.0)
+                        logit_bias: Dict[int, float] = {}
+                        try:
+                            think_toks = llm.tokenize("<think>".encode("utf-8"), add_bos=False)
+                            for t in think_toks:
+                                logit_bias[t] = -100.0
+                            log_message("debug", f"Suppressed reasoning tokens: {think_toks}")
+                        except Exception as tb_err:
+                            log_message("debug", f"Could not calculate think token logit_bias: {tb_err}")
+
                         text_result_chunks = []
                         comp_gen = llm.create_completion(
                             prompt=new_turn_tokens, max_tokens=512, stream=True,
                             temperature=0.7, top_k=40, top_p=0.9,
+                            logit_bias=logit_bias,
                             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
                         )
+
                         for chunk in comp_gen:
                             text_result_chunks.append(chunk["choices"][0]["text"])
 
