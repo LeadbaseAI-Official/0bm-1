@@ -194,14 +194,16 @@ async def run_model_query(
                         log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
 
                         # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
-                        # Stop tokens for Qwen ChatML (including malformed tags)
+                        # Stop tokens for Qwen ChatML (strictly single special token IDs)
                         stop_token_ids = set()
-                        for s_str in ["<|im_end|>", "<|im_start|>", "</|im_start|>", "<|endoftext|>"]:
+                        for s_str in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
                             try:
                                 s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False, special=True)
-                                stop_token_ids.update(s_toks)
+                                if len(s_toks) == 1:
+                                    stop_token_ids.update(s_toks)
                             except Exception:
                                 pass
+
                         try:
                             eos_id = llm.token_eos()
                             if eos_id is not None:
