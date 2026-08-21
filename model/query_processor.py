@@ -99,8 +99,10 @@ async def run_model_query(
                             prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
 
                         # ─── STEP 1: Qwen ChatML Turn Tokenization ───
-                        new_turn_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                        # Closed <think>\n\n</think>\n\n tells Qwen 3.5 to bypass reasoning and output final answer directly
+                        new_turn_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                         new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
+
 
                         convo_file = STATES_DIR / f"{customer_key}.bin"
                         history: List[Dict[str, str]] = []
@@ -192,24 +194,6 @@ async def run_model_query(
                         log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
 
                         # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
-                        # Suppress reasoning <think> tokens via LogitsProcessorList
-                        from llama_cpp import LogitsProcessorList
-
-                        think_toks: List[int] = []
-                        try:
-                            think_toks = llm.tokenize("<think>".encode("utf-8"), add_bos=False)
-                            log_message("debug", f"Suppressed reasoning token IDs: {think_toks}")
-                        except Exception as tb_err:
-                            log_message("debug", f"Could not calculate think token IDs: {tb_err}")
-
-                        def suppress_think_logits_processor(input_ids_arr: np.ndarray, logits_arr: np.ndarray) -> np.ndarray:
-                            for t in think_toks:
-                                if t < len(logits_arr):
-                                    logits_arr[t] = -1000.0
-                            return logits_arr
-
-                        logits_processors = LogitsProcessorList([suppress_think_logits_processor]) if think_toks else None
-
                         # Stop tokens for Qwen ChatML
                         stop_token_ids = set()
                         for s_str in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
@@ -227,7 +211,6 @@ async def run_model_query(
                             pass
                         log_message("debug", f"Configured stop token IDs: {stop_token_ids}")
 
-
                         start_n: int = llm.n_tokens
                         log_message("debug", f"Evaluating {len(new_turn_tokens)} new turn tokens starting at n_tokens={start_n}...")
                         llm.eval(new_turn_tokens)
@@ -240,8 +223,7 @@ async def run_model_query(
                             token_id = llm.sample(
                                 temp=0.7,
                                 top_k=40,
-                                top_p=0.9,
-                                logits_processor=logits_processors
+                                top_p=0.9
                             )
                             if token_id in stop_token_ids:
                                 log_message("debug", f"Reached stop token ID: {token_id} at step {step}")
@@ -251,9 +233,13 @@ async def run_model_query(
                             text_result_chunks.append(piece_str)
                             llm.eval([token_id])
 
-
                         raw_text = "".join(text_result_chunks)
-                        cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', raw_text)[0]
+                        log_message("debug", f"Raw Generated Text ({len(raw_text)} chars): {repr(raw_text)}")
+
+                        # Strip <think>...</think> reasoning blocks cleanly
+                        cleaned_text = re.sub(r'<think>[\s\S]*?</think>', '', raw_text, flags=re.IGNORECASE)
+                        cleaned_text = re.split(r'<\|im_(?:start|end)[\|>\}]?', cleaned_text)[0]
+
 
 
                         abandon_token: Optional[str] = None
