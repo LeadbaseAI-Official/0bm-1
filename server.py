@@ -9,7 +9,9 @@ import threading
 import requests
 import datetime
 import pickle
+import gzip
 from typing import Optional, Dict, Any, List
+
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Response, BackgroundTasks
 from pydantic import BaseModel
