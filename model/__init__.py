@@ -3,6 +3,7 @@ from model.cache_manager import (
     save_state_bg,
     download_states_from_huggingface,
     upload_states_to_huggingface,
+    clear_huggingface_and_local_states,
     STATES_DIR,
     GLOBAL_CACHE_DIR,
 )
@@ -19,9 +20,11 @@ __all__ = [
     "save_state_bg",
     "download_states_from_huggingface",
     "upload_states_to_huggingface",
+    "clear_huggingface_and_local_states",
     "STATES_DIR",
     "GLOBAL_CACHE_DIR",
     "queue_global_rebuild",
     "run_3_45_lifecycle_timer",
     "MODEL_CODE"
 ]
+
