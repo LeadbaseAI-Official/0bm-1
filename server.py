@@ -21,9 +21,10 @@ from model import (
     run_model_query, MODEL_CODE, log_message, get_llm,
     run_3_45_lifecycle_timer, queue_global_rebuild,
     download_states_from_huggingface, upload_states_to_huggingface,
-    clear_huggingface_and_local_states,
+    clear_huggingface_and_local_states, ensure_input_ids_capacity,
     STATES_DIR, GLOBAL_CACHE_DIR
 )
+
 
 from model.engine import _eval_lock
 from model.cache_manager import _ram_states_cache, save_state_bg
