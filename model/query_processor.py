@@ -209,7 +209,9 @@ async def run_model_query(
                             abandon_token = abandon_match.group(1).strip()
                         
                         cleaned_text = re.sub(r'<abandon>[\s\S]*?(?:</abandon>|<>|>|$)', '', cleaned_text, flags=re.IGNORECASE)
+                        cleaned_text = re.split(r'<abandon', cleaned_text, flags=re.IGNORECASE)[0]
                         text_result = cleaned_text.strip()
+
 
                         # Deterministic Fallback: If calendly/booking link is in text or prompt, enforce BOOKED token!
                         if not abandon_token:
