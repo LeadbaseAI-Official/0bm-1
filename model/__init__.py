@@ -9,7 +9,7 @@ from model.cache_manager import (
 )
 from model.query_processor import run_model_query, ensure_input_ids_capacity
 from model.rebuilder import queue_global_rebuild
-from model.lifecycle import run_3_45_lifecycle_timer
+from model.lifecycle import run_5_30_lifecycle_timer
 
 MODEL_CODE = "0bm"
 
@@ -25,8 +25,9 @@ __all__ = [
     "STATES_DIR",
     "GLOBAL_CACHE_DIR",
     "queue_global_rebuild",
-    "run_3_45_lifecycle_timer",
+    "run_5_30_lifecycle_timer",
     "MODEL_CODE"
 ]
+
 
 
