@@ -32,21 +32,22 @@ def trigger_self_workflow_dispatch(pat: str, org: str, repo_name: str) -> bool:
         log_message("lifecycle", f"[Self Dispatch] Error dispatching workflow: {err}")
     return False
 
-def run_3_45_lifecycle_timer(pat: str, org: str, repo_name: str, duration_hours: float) -> None:
+def run_5_30_lifecycle_timer(pat: str, org: str, repo_name: str, duration_hours: float = 5.5) -> None:
     """
-    Background timer reaching 3:45 mark, stopping incoming request acceptance,
-    uploading states to Hugging Face, triggering new runner dispatch, and exiting instantly.
+    Background timer reaching 5:30h mark, stopping incoming request acceptance,
+    uploading states to Hugging Face, triggering new runner dispatch, and exiting cleanly.
     """
     global is_accepting_requests
     duration_seconds: float = duration_hours * 3600
-    sync_lead_time = 15 * 60  # 15 minutes before 4h limit (3:45 mark)
+    sync_lead_time = 15 * 60  # 15 minutes before duration limit
     sleep_first = max(0.0, duration_seconds - sync_lead_time)
 
-    log_message("lifecycle", f"3:45 Uptime timer started. Handover scheduled in {sleep_first / 60:.1f} minutes.")
+    log_message("lifecycle", f"5:30 Uptime timer started. Handover scheduled in {sleep_first / 60:.1f} minutes.")
     time.sleep(sleep_first)
 
-    log_message("lifecycle", "3:45 Uptime mark reached. Stopping request acceptance (HTTP 503 fallback redirect)...")
+    log_message("lifecycle", "5:30 Uptime mark reached. Stopping request acceptance (HTTP 503 fallback redirect)...")
     is_accepting_requests = False
+
 
     # Wait 3 seconds for active in-flight query evaluation locks to clear
     time.sleep(3)
