@@ -46,28 +46,24 @@ async def get_jid_lock(jid_key: str) -> asyncio.Lock:
 
 async def run_model_query(
     prompt: str,
-    phone_number: Optional[str] = None,
-    clean_number: Optional[str] = None,
-    jid: Optional[str] = None,
-    image_base64: Optional[str] = None
+    phone_number: str
 ) -> Dict[str, Any]:
     """
     Evaluates an incoming prompt against the Llama model using 3-slot concurrency
-    and per-JID sequential locking for KV state consistency.
+    and per-phone_number sequential locking for KV state consistency.
     """
     global _concurrency_semaphore
     if _concurrency_semaphore is None:
         _concurrency_semaphore = asyncio.Semaphore(PARALLEL_SLOTS)
 
-    # Determine primary customer key (e.g. cleanNumber, phone_number, or JID)
-    customer_key: str = clean_number or phone_number or jid or "default"
+    customer_key: str = phone_number or "default"
     jid_lock = await get_jid_lock(customer_key)
 
-    # Enforce sequential execution per customer_key while allowing 3-slot slot parallelism
+    # Enforce sequential execution per customer_key while allowing 3-slot parallelism
     async with jid_lock:
         async with _concurrency_semaphore:
             def evaluate_query() -> Dict[str, Any]:
-                nonlocal prompt, image_base64
+                nonlocal prompt
                 global _ram_states_cache
                 with _eval_lock:
                     try:
@@ -83,30 +79,13 @@ async def run_model_query(
                             log_message("debug", "Global KV cache rebuild in progress. Temporarily holding query.")
                             return {"response": "System maintenance in progress. Please try again shortly.", "abandon_token": None}
 
-                        # Vision mode handling
-                        if image_base64 and getattr(llm, "chat_handler", None) is not None:
-                            log_message("system", f"Running vision query with image size {len(image_base64)} chars")
-                            if not image_base64.startswith("data:image"):
-                                image_base64 = f"data:image/jpeg;base64,{image_base64}"
-                            res_gen = llm.create_chat_completion(
-                                messages=[{"role": "user", "content": [{"type": "text", "text": prompt}, {"type": "image_url", "image_url": {"url": image_base64}}]}],
-                                max_tokens=512, stream=True
-                            )
-                            chunks = [c["choices"][0]["delta"]["content"] for c in res_gen if "content" in c["choices"][0]["delta"]]
-                            text_res = "".join(chunks)
-                            return {"response": text_res, "abandon_token": None}
-                        elif image_base64:
-                            prompt = f"[User uploaded an image. Base64 length: {len(image_base64)}]\n{prompt}"
-
                         # ─── STEP 1: Qwen ChatML Turn Tokenization ───
                         # Closed <think>\n\n</think>\n\n tells Qwen 3.5 to bypass reasoning and output final answer directly
                         new_turn_text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
                         new_turn_tokens = llm.tokenize(new_turn_text.encode("utf-8"))
 
-
                         convo_file = STATES_DIR / f"{customer_key}.bin"
-                        history: List[Dict[str, str]] = []
-                        msg_count: int = 0
+                        history_str: str = ""
                         loaded_convo: bool = False
 
                         # ─── STEP 2: Level-1 RAM LRU Cache ───
@@ -115,8 +94,7 @@ async def run_model_query(
                             _ram_states_cache.move_to_end(customer_key)
                             llm.load_state(ram_obj["state"])
                             ensure_input_ids_capacity(llm)
-                            history = ram_obj.get("history", [])
-                            msg_count = ram_obj.get("msg_count", 0)
+                            history_str = ram_obj.get("history", "")
                             loaded_convo = True
                             log_message("debug", f"STEP 2: RAM LRU HIT ✓ (n_tokens={llm.n_tokens})")
                         else:
@@ -130,8 +108,7 @@ async def run_model_query(
                                     if isinstance(customer_obj, dict) and "state" in customer_obj:
                                         llm.load_state(customer_obj["state"])
                                         ensure_input_ids_capacity(llm)
-                                        history = customer_obj.get("history", [])
-                                        msg_count = customer_obj.get("msg_count", 0)
+                                        history_str = customer_obj.get("history", "")
                                         loaded_convo = True
                                         log_message("debug", f"STEP 3: DISK HIT ✓ (n_tokens={llm.n_tokens})")
                                 except Exception as e:
@@ -165,33 +142,12 @@ async def run_model_query(
                                     llm.load_state(global_cache_state)
                                     ensure_input_ids_capacity(llm)
                                     log_message("debug", f"STEP 4: Initialized from GLOBAL_SEED (n_tokens={llm.n_tokens})")
-
-                                    if isinstance(payload_obj, dict) and "tokens" in payload_obj:
-                                        global_tokens = payload_obj["tokens"]
-                                        log_message("debug", f"═════════════════ GLOBAL SEED TOKEN DUMP (Total: {len(global_tokens)}) ═════════════════")
-                                        log_message("debug", f"Global Token IDs: {global_tokens}")
-                                        try:
-                                            decoded_global = [llm.detokenize([t]).decode("utf-8", errors="ignore") for t in global_tokens]
-                                            log_message("debug", f"Global Decoded Tokens: {decoded_global}")
-                                        except Exception as dt_err:
-                                            log_message("debug", f"Global detokenize err: {dt_err}")
-                                        log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
                                 else:
                                     log_message("debug", "STEP 4: UNCONFIGURED MODEL FALLBACK")
                                     return {
                                         "response": "Sorry, I cannot process this request since the model is not configured.",
                                         "abandon_token": None
                                     }
-
-                        log_message("debug", f"═════════════════ NEW TURN TOKEN DUMP (Total: {len(new_turn_tokens)}) ═════════════════")
-                        log_message("debug", f"New Turn Token IDs: {new_turn_tokens}")
-                        try:
-                            decoded_turn = [llm.detokenize([t]).decode("utf-8", errors="ignore") for t in new_turn_tokens]
-                            log_message("debug", f"New Turn Decoded Tokens: {decoded_turn}")
-                        except Exception as dt_err2:
-                            log_message("debug", f"New Turn detokenize err: {dt_err2}")
-                        log_message("debug", f"Current LLM State n_tokens before generate: {llm.n_tokens}")
-                        log_message("debug", f"═══════════════════════════════════════════════════════════════════════════════")
 
                         # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
                         # Stop tokens for Qwen ChatML (strictly single special token IDs)
@@ -245,33 +201,28 @@ async def run_model_query(
                         cleaned_text = re.split(r'</?\|?im_(?:start|end)[\|>\}]?', cleaned_text, flags=re.IGNORECASE)[0]
                         cleaned_text = re.split(r'<\|[a-zA-Z0-9_|]+\|>', cleaned_text)[0]
 
-
-
-
                         abandon_token: Optional[str] = None
-                        abandon_match = re.search(r'<abandon>(.*?)</abandon>', cleaned_text, re.IGNORECASE | re.DOTALL)
+                        abandon_match = re.search(r'<abandon>([a-zA-Z0-9_\-\s]+)(?:</abandon>|<>|>|$)', raw_text, re.IGNORECASE)
                         if abandon_match:
                             abandon_token = abandon_match.group(1).strip()
-                        cleaned_text = re.sub(r'<abandon>[\s\S]*?</abandon>', '', cleaned_text, flags=re.IGNORECASE)
+                        cleaned_text = re.sub(r'<abandon>[\s\S]*?(?:</abandon>|<>|>|$)', '', cleaned_text, flags=re.IGNORECASE)
                         text_result = cleaned_text.strip()
+
 
                         log_message("response", f"{text_result}{' [ABANDON:' + abandon_token + ']' if abandon_token else ''}")
 
                         # ─── STEP 6: Save State to RAM LRU & Disk ───
                         try:
-                            history.append({"role": "user", "content": prompt})
-                            history.append({"role": "assistant", "content": text_result})
-                            msg_count += 2
+                            history_str += f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n{text_result}<|im_end|>\n"
                             state_obj = llm.save_state()
                             actual_n = llm.n_tokens
                             full_tokens = llm.input_ids.tolist()[:actual_n]
 
                             customer_obj = {
-                                "customer_key": customer_key,
+                                "phone_number": customer_key,
                                 "state": state_obj,
                                 "tokens": full_tokens,
-                                "history": history,
-                                "msg_count": msg_count
+                                "history": history_str
                             }
 
                             _ram_states_cache[customer_key] = customer_obj
@@ -282,9 +233,6 @@ async def run_model_query(
                                 evicted_key, evicted_obj = _ram_states_cache.popitem(last=False)
                                 evicted_file = STATES_DIR / f"{evicted_key}.bin"
                                 save_state_bg(evicted_file, evicted_obj)
-
-                            if msg_count >= MAX_HISTORY:
-                                abandon_token = "MAX_LIMIT_REACHED"
                         except Exception as save_err:
                             log_message("debug", f"STEP 6: SAVE FAILED ✗: {save_err}")
 
