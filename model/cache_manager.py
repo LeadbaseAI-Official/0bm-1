@@ -152,17 +152,24 @@ def clear_huggingface_and_local_states(model_id: str = "default") -> bool:
     try:
         from huggingface_hub import HfApi
         api = HfApi(token=token)
-        api.delete_folder(
-            path_in_repo=f"models/{model_id}",
-            repo_id=HF_REPO_ID,
-            repo_type="dataset",
-            commit_message=f"Clear outdated states for model {model_id} upon global KV update"
-        )
-        log_message("system", f"[HF Clear] Successfully cleared remote HF dataset files for model '{model_id}'.")
+        try:
+            api.delete_folder(
+                path_in_repo=f"models/{model_id}",
+                repo_id=HF_REPO_ID,
+                repo_type="dataset",
+                commit_message=f"Clear outdated states for model {model_id} upon global KV update"
+            )
+            log_message("system", f"[HF Clear] Successfully cleared remote HF dataset files for model '{model_id}'.")
+        except Exception as delete_err:
+            if "404" in str(delete_err) or "Not Found" in str(delete_err):
+                log_message("system", f"[HF Clear] Remote HF folder 'models/{model_id}' does not exist yet. Skipping deletion.")
+            else:
+                log_message("system", f"[HF Clear] Folder delete note: {delete_err}")
         return True
     except Exception as err:
-        log_message("system", f"[HF Clear] Warning: Hugging Face folder delete note: {err}")
+        log_message("system", f"[HF Clear] Warning: Hugging Face clear exception: {err}")
         return False
+
 
 
 
