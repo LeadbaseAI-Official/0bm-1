@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 
 from model import (
     run_model_query, MODEL_CODE, log_message, get_llm,
-    run_3_45_lifecycle_timer, queue_global_rebuild,
+    run_5_30_lifecycle_timer, queue_global_rebuild,
     download_states_from_huggingface, upload_states_to_huggingface,
     clear_huggingface_and_local_states, ensure_input_ids_capacity,
     STATES_DIR, GLOBAL_CACHE_DIR
@@ -32,20 +32,16 @@ from model.lifecycle import is_accepting_requests
 
 class ChatRequest(BaseModel):
     prompt: Optional[str] = None
-    userMessage: Optional[str] = None
-    phone_number: Optional[str] = None
-    cleanNumber: Optional[str] = None
-    jid: Optional[str] = None
-    image_base64: Optional[str] = None
+    user_question: Optional[str] = None
+    phone_number: str
 
 class ClearRequest(BaseModel):
-    phone_number: Optional[str] = None
-    cleanNumber: Optional[str] = None
-    jid: Optional[str] = None
+    phone_number: str  # number string or "all"
 
-class GlobalUpdateItem(BaseModel):
-    client_id: Optional[str] = None
+class StateUpdateItem(BaseModel):
+    client_id: str
     state_bytes_base64: str
+    rebuilt_customer_states: Optional[Dict[str, str]] = None
 
 def send_ready_signal_to_agent0(client_id: str) -> bool:
     """
@@ -352,12 +348,13 @@ def update_github_dns(pat: str, org: str, public_url: str, repo_name: str) -> No
 
 async def drain_upstash_redis_queue() -> int:
     """
-    Drains FIFO queued fallback messages from Upstash Redis key 'agent0:fallback_queue' on startup
-    and processes them sequentially through the LLM pipeline.
+    Drains FIFO queued fallback messages from Upstash Redis per client key 'fallback_queue:{client_id}'
+    on startup and processes them sequentially through the LLM pipeline.
     """
     redis_url = os.getenv("UPSTASH_REDIS_REST_URL", "").rstrip("/")
     redis_token = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
-    queue_key = os.getenv("REDIS_FALLBACK_QUEUE", "agent0:fallback_queue")
+    client_id = os.getenv("CLIENT_ID", "default")
+    queue_key = f"fallback_queue:{client_id}"
 
     if not redis_url or not redis_token:
         log_message("system", "[Redis Drain] Upstash Redis credentials not set. Skipping queue drain.")
@@ -382,16 +379,14 @@ async def drain_upstash_redis_queue() -> int:
 
             try:
                 item = json.loads(payload_raw) if isinstance(payload_raw, str) else payload_raw
-                user_msg = item.get("userMessage") or item.get("prompt") or ""
-                clean_num = item.get("cleanNumber")
-                user_jid = item.get("jid")
+                user_msg = item.get("msg") or item.get("prompt") or item.get("userMessage") or ""
+                p_num = item.get("phone_number") or item.get("cleanNumber") or ""
 
-                if user_msg:
-                    log_message("system", f"[Redis Drain] Processing queued message from {clean_num or user_jid}...")
+                if user_msg and p_num:
+                    log_message("system", f"[Redis Drain] Processing queued message from {p_num}...")
                     await run_model_query(
                         prompt=user_msg,
-                        clean_number=clean_num,
-                        jid=user_jid
+                        phone_number=p_num
                     )
                     drained_count += 1
             except Exception as item_err:
@@ -403,21 +398,36 @@ async def drain_upstash_redis_queue() -> int:
 
     return drained_count
 
+def get_current_repo_name() -> str:
+    """
+    Auto-detects repository name directly from git remote config or current working directory.
+    Zero environment variables required!
+    """
+    try:
+        out = subprocess.check_output(["git", "config", "--get", "remote.origin.url"], text=True, stderr=subprocess.DEVNULL).strip()
+        if out:
+            repo = out.rstrip("/").removesuffix(".git").split("/")[-1]
+            if repo:
+                return repo
+    except Exception:
+        pass
+    return Path(".").resolve().name
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     pat: str = os.getenv("GITHUB_PAT", "")
     org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
-    repo_full: str = os.getenv("GITHUB_REPOSITORY", "")
-    repo_name: str = repo_full.split("/")[-1] if "/" in repo_full else "test"
+    repo_name: str = get_current_repo_name()
 
-    duration_str: str = os.getenv("RUN_DURATION_HOURS", "4.0")
+    duration_str: str = os.getenv("RUN_DURATION_HOURS", "5.5")
     try:
         duration_hours: float = float(duration_str)
     except ValueError:
-        duration_hours = 4.0
+        duration_hours = 5.5
 
     # 1. Download customer states & global seed from Hugging Face for this repo_name
     download_states_from_huggingface(repo_name)
+
 
     # 2. Warm up model weights
     log_message("system", "Warming up model weights...")
@@ -431,9 +441,9 @@ async def lifespan(app: FastAPI):
     # 3. Drain Upstash Redis fallback queue
     await drain_upstash_redis_queue()
 
-    # 4. Start 3:45h lifecycle timer (fast handover & exit)
+    # 4. Start 5:30h lifecycle timer
     threading.Thread(
-        target=run_3_45_lifecycle_timer,
+        target=run_5_30_lifecycle_timer,
         args=(pat, org, repo_name, duration_hours),
         daemon=True
     ).start()
@@ -456,49 +466,27 @@ async def chat(req: ChatRequest) -> Dict[str, Any]:
             detail="Runner is currently recycling. Incoming message redirected to Redis fallback queue."
         )
 
-    prompt_text = req.prompt or req.userMessage
-    if not prompt_text:
-        raise HTTPException(status_code=400, detail="Prompt or userMessage parameter is required.")
+    prompt_text = req.prompt or req.user_question
+    if not prompt_text or not req.phone_number:
+        raise HTTPException(status_code=400, detail="Parameters 'prompt' (or 'user_question') and 'phone_number' are required.")
 
     result = await run_model_query(
         prompt=prompt_text,
-        phone_number=req.phone_number,
-        clean_number=req.cleanNumber,
-        jid=req.jid,
-        image_base64=req.image_base64
+        phone_number=req.phone_number
     )
     if isinstance(result, str):
         raise HTTPException(status_code=500, detail=result)
 
     return {
         "response": result.get("response", ""),
-        "abandon_token": result.get("abandon_token"),
-        "prompt": prompt_text
-    }
-
-@app.post("/v1/summarize")
-def summarize_all_active_states(req: SummarizeRequest) -> Dict[str, Any]:
-    """
-    Extracts 100-150 word customer summaries from all active .bin states in RAM LRU & Disk.
-    """
-    all_keys: set[str] = set(_ram_states_cache.keys())
-    for pfile in STATES_DIR.glob("*.bin"):
-        all_keys.add(pfile.stem)
-
-    results: Dict[str, str] = {}
-    for ckey in all_keys:
-        pfile = STATES_DIR / f"{ckey}.bin"
-        summ = extract_customer_summary(ckey, pfile)
-        if summ:
-            results[ckey] = summ
-    return {
-        "total_customers": len(results),
-        "summaries": results
+        "phone_number": req.phone_number,
+        "abandon_token": result.get("abandon_token")
     }
 
 
-@app.post("/v1/global-update")
-def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+@app.post("/v1/state-update")
+
+def receive_state_update(req: StateUpdateItem, background_tasks: BackgroundTasks) -> Dict[str, Any]:
     """
     Receives compiled binary KV state from kv_worker, decompresses it,
     saves to GLOBAL_CACHE_DIR / "global.bin", triggers background KV rebuild,
@@ -508,8 +496,8 @@ def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTas
         c_id: str = req.client_id or "default"
         
         print("\n" + "═" * 65, flush=True)
-        log_message("GLOBAL_UPDATE", f"📥 RECEIVED COMPILED KV STATE for client_id='{c_id}'")
-        log_message("GLOBAL_UPDATE", f"   Base64 Payload Size: {len(req.state_bytes_base64)} chars")
+        log_message("STATE_UPDATE", f"📥 RECEIVED COMPILED KV STATE for client_id='{c_id}'")
+        log_message("STATE_UPDATE", f"   Base64 Payload Size: {len(req.state_bytes_base64)} chars")
         print("═" * 65, flush=True)
         
         compressed_bytes: bytes = base64.b64decode(req.state_bytes_base64)
@@ -519,51 +507,66 @@ def receive_global_update(req: GlobalUpdateItem, background_tasks: BackgroundTas
         state_data = payload_obj.get("state")
         tokens_data = payload_obj.get("tokens", [])
         
-        log_message("GLOBAL_UPDATE", f"Decompressed state size: {len(raw_bytes)} bytes (~{len(raw_bytes)/(1024*1024):.2f} MB), token count: {len(tokens_data)}")
+        log_message("STATE_UPDATE", f"Decompressed state size: {len(raw_bytes)} bytes (~{len(raw_bytes)/(1024*1024):.2f} MB), token count: {len(tokens_data)}")
         
         # Save to global cache directory
         GLOBAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         global_file: Path = GLOBAL_CACHE_DIR / "global.bin"
         with open(global_file, "wb") as gf:
             gf.write(raw_bytes)
-        log_message("GLOBAL_UPDATE", f"Saved global seed to disk: {global_file}")
+        log_message("STATE_UPDATE", f"Saved global seed to disk: {global_file}")
         
-        repo_full: str = os.getenv("GITHUB_REPOSITORY", "")
-        repo_name: str = repo_full.split("/")[-1] if "/" in repo_full else "test"
+        repo_name: str = get_current_repo_name()
         clear_huggingface_and_local_states(repo_name)
+
+
+        # If rebuilt_customer_states provided (rebuild_states=True), save rebuilt states
+        if req.rebuilt_customer_states:
+            for p_num, c_b64 in req.rebuilt_customer_states.items():
+                try:
+                    c_bytes = gzip.decompress(base64.b64decode(c_b64))
+                    c_obj = pickle.loads(c_bytes)
+                    c_file = STATES_DIR / f"{p_num}.bin"
+                    with open(c_file, "wb") as cf:
+                        cf.write(c_bytes)
+                    log_message("STATE_UPDATE", f"Saved rebuilt customer state for {p_num}")
+                except Exception as r_err:
+                    log_message("STATE_UPDATE", f"Error saving rebuilt state for {p_num}: {r_err}")
 
         # Trigger background KV cache rebuild for active conversations
         if state_data:
             queue_global_rebuild(state_data, tokens_data)
-            log_message("GLOBAL_UPDATE", f"✅ Successfully queued global KV cache rebuild for client '{c_id}'!")
+            log_message("STATE_UPDATE", f"✅ Successfully queued global KV cache rebuild for client '{c_id}'!")
             
         # Dispatch READY completion signal from 0bm runner back to Agent-0
         background_tasks.add_task(send_ready_signal_to_agent0, c_id)
-
             
         print("═" * 65 + "\n", flush=True)
         return {"status": "success", "client_id": c_id, "state_size_bytes": len(raw_bytes)}
     except Exception as ex:
         import traceback
         traceback.print_exc()
-        log_message("GLOBAL_UPDATE", f"❌ Failed to process received KV state update: {ex}")
-        raise HTTPException(status_code=500, detail=f"Global update failed: {str(ex)}")
+        log_message("STATE_UPDATE", f"❌ Failed to process received KV state update: {ex}")
+        raise HTTPException(status_code=500, detail=f"State update failed: {str(ex)}")
 
 
 
 
-@app.post("/v1/chat/clear")
+@app.post("/v1/clear-chat")
 async def clear_chat_state(req: ClearRequest) -> Dict[str, Any]:
     try:
-        target_key = req.cleanNumber or req.phone_number or req.jid
-        if target_key:
+        target_key = req.phone_number.strip()
+        if target_key and target_key != "all":
             state_file = STATES_DIR / f"{target_key}.bin"
             if state_file.exists():
                 state_file.unlink()
-                log_message("system", f"Cleared conversation history cache for key: {target_key}")
+            if target_key in _ram_states_cache:
+                del _ram_states_cache[target_key]
+            log_message("system", f"Cleared conversation history cache for phone_number: {target_key}")
         else:
             for path in STATES_DIR.glob("*.bin"):
                 path.unlink()
+            _ram_states_cache.clear()
             log_message("system", "Cleared all customer conversation history caches")
         return {"success": True}
     except Exception as e:
@@ -571,5 +574,3 @@ async def clear_chat_state(req: ClearRequest) -> Dict[str, Any]:
 
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=False, access_log=False)
-
-
