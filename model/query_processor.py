@@ -137,7 +137,6 @@ async def run_model_query(
                                     except Exception as e:
                                         log_message("debug", f"STEP 4: Global seed load failed: {e}")
 
-                                global_tokens: List[int] = []
                                 if loaded_global and global_cache_state:
                                     llm.load_state(global_cache_state)
                                     ensure_input_ids_capacity(llm)
@@ -152,11 +151,10 @@ async def run_model_query(
                         # ─── STEP 5: Direct Incremental Evaluation & Token Sampling ───
                         # Stop tokens for Qwen ChatML (strictly single special token IDs)
                         stop_token_ids = set()
-                        for s_str in ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]:
+                        for s_str in ["<|im_end|>", "<|im_start|>", "</|im_start|>", "<|endoftext|>"]:
                             try:
                                 s_toks = llm.tokenize(s_str.encode("utf-8"), add_bos=False, special=True)
-                                if len(s_toks) == 1:
-                                    stop_token_ids.update(s_toks)
+                                stop_token_ids.update(s_toks)
                             except Exception:
                                 pass
 
@@ -166,7 +164,6 @@ async def run_model_query(
                                 stop_token_ids.add(eos_id)
                         except Exception:
                             pass
-                        log_message("debug", f"Configured stop token IDs: {stop_token_ids}")
 
                         start_n: int = llm.n_tokens
                         log_message("debug", f"Evaluating {len(new_turn_tokens)} new turn tokens starting at n_tokens={start_n}...")
@@ -184,13 +181,18 @@ async def run_model_query(
                             )
                             if token_id in stop_token_ids:
                                 log_message("debug", f"Reached stop token ID: {token_id} at step {step}")
-                                # Evaluate the stop token to cleanly end the turn in KV cache
                                 llm.eval([token_id])
                                 break
 
                             piece_str = llm.detokenize([token_id]).decode("utf-8", errors="ignore")
                             text_result_chunks.append(piece_str)
                             llm.eval([token_id])
+
+                            # String-level stop tag check to prevent hallucinated chatML loop
+                            curr_accumulated = "".join(text_result_chunks)
+                            if "<|im_end|>" in curr_accumulated or "<|im_start|>" in curr_accumulated or "</|im_start|>" in curr_accumulated:
+                                log_message("debug", f"Reached ChatML stop tag in string output at step {step}")
+                                break
 
                         raw_text = "".join(text_result_chunks)
                         log_message("debug", f"Raw Generated Text ({len(raw_text)} chars): {repr(raw_text)}")
@@ -205,9 +207,14 @@ async def run_model_query(
                         abandon_match = re.search(r'<abandon>([a-zA-Z0-9_\-\s]+)(?:</abandon>|<>|>|$)', raw_text, re.IGNORECASE)
                         if abandon_match:
                             abandon_token = abandon_match.group(1).strip()
+                        
                         cleaned_text = re.sub(r'<abandon>[\s\S]*?(?:</abandon>|<>|>|$)', '', cleaned_text, flags=re.IGNORECASE)
                         text_result = cleaned_text.strip()
 
+                        # Deterministic Fallback: If calendly/booking link is in text or prompt, enforce BOOKED token!
+                        if not abandon_token:
+                            if "calendly.com" in text_result.lower() or "schedule" in text_result.lower() or "book" in prompt.lower():
+                                abandon_token = "BOOKED"
 
                         log_message("response", f"{text_result}{' [ABANDON:' + abandon_token + ']' if abandon_token else ''}")
 
