@@ -49,9 +49,10 @@ def send_ready_signal_to_agent0(client_id: str) -> bool:
     Hardcoded candidate URLs: Production placeholder first, falling back to local dev Cloudflare Tunnel.
     """
     candidate_urls: List[str] = [
-        os.getenv("PRODUCTION_AGENT0_URL", "https://placeholder-production-domain.com").strip(),
-        os.getenv("AGENT0_WEBHOOK_URL", "https://brother-review-attachments-satisfactory.trycloudflare.com/api/knowledge/kv-complete").strip()
+        os.getenv("PRODUCTION_AGENT0_URL", "https://relatives-nerve-complications-grey.trycloudflare.com/api/knowledge/kv-complete").strip(),
+        os.getenv("AGENT0_WEBHOOK_URL", "https://relatives-nerve-complications-grey.trycloudflare.com/api/knowledge/kv-complete").strip()
     ]
+
     
     payload: Dict[str, Any] = {
         "client_id": client_id,
