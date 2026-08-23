@@ -12,9 +12,9 @@ _llm_instance: Optional[Llama] = None
 def log_message(tag: str, msg: str) -> None:
     from datetime import datetime as dt, timezone, timedelta
     ist_now = dt.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    now_str = ist_now.strftime("%H:%M:%S")
-    day_str = ist_now.strftime("%d")
-    print(f"[{now_str} | {day_str}] [{tag}] : {msg}", flush=True)
+    stamp_str = ist_now.strftime("%H:%M | %d")
+    print(f"[{stamp_str}] [{tag.upper()}] : \"{msg}\"", flush=True)
+
 
 def find_gguf_file() -> Path:
     for path in Path(".").glob("*.gguf"):
