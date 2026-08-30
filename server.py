@@ -43,41 +43,42 @@ class StateUpdateItem(BaseModel):
     state_bytes_base64: str
     rebuilt_customer_states: Optional[Dict[str, str]] = None
 
-def send_ready_signal_to_agent0(client_id: str) -> bool:
+def send_kv_complete_to_redis(client_id: str) -> bool:
     """
-    Dispatches completion READY signal directly from 0bm runner back to Agent-0 server.
-    Hardcoded candidate URLs: Production placeholder first, falling back to local dev Cloudflare Tunnel.
+    Writes kv_status:{client_id} = "complete" to Upstash Redis.
+    The wa-gateway runner polls this key every 4s and drains the
+    fallback message queue when it sees "complete".
+    Replaces the old HTTP webhook to walone.vercel.app/api/knowledge/kv-complete.
     """
-    candidate_urls: List[str] = [
-        os.getenv("PRODUCTION_AGENT0_URL", "https://walone.vercel.app/api/knowledge/kv-complete").strip(),
-        os.getenv("AGENT0_WEBHOOK_URL", "https://walone.vercel.app/api/knowledge/kv-complete").strip()
-    ]
+    upstash_url: str = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+    upstash_token: str = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
+    if not upstash_url or not upstash_token:
+        log_message("SIGNAL", f"❌ Upstash Redis env vars missing. Cannot send kv_complete for client '{client_id}'.")
+        return False
 
-    
-    payload: Dict[str, Any] = {
-        "client_id": client_id,
-        "status": "ready"
-    }
+    redis_key: str = f"kv_status:{client_id}"
+    log_message("SIGNAL", f"📡 Writing kv_status=complete to Redis for client '{client_id}' (key: {redis_key})...")
 
-    for base_url in candidate_urls:
-        if not base_url or "placeholder" in base_url:
-            continue
-            
-        target_endpoint: str = base_url if base_url.endswith("/kv-complete") else f"{base_url.rstrip('/')}/api/knowledge/kv-complete"
-        log_message("SIGNAL", f"📡 Dispatching READY signal for client '{client_id}' to Agent-0 at '{target_endpoint}'...")
-        try:
-            res = requests.post(target_endpoint, json=payload, timeout=15)
-            if res.status_code == 200:
-                log_message("SIGNAL", f"✅ READY signal accepted by Agent-0 (HTTP 200) for client '{client_id}'.")
-                return True
-            else:
-                log_message("SIGNAL", f"⚠️ Agent-0 at '{target_endpoint}' returned HTTP {res.status_code}. Trying next URL...")
-        except Exception as err:
-            log_message("SIGNAL", f"⚠️ Failed to reach Agent-0 at '{target_endpoint}': {err}")
-
-    log_message("SIGNAL", f"❌ All candidate Agent-0 webhook URLs failed for client '{client_id}'.")
-    return False
+    try:
+        res = requests.post(
+            upstash_url,
+            json=["SET", redis_key, "complete"],
+            headers={
+                "Authorization": f"Bearer {upstash_token}",
+                "Content-Type": "application/json",
+            },
+            timeout=10,
+        )
+        if res.status_code == 200:
+            log_message("SIGNAL", f"✅ kv_status=complete written to Redis for client '{client_id}'.")
+            return True
+        else:
+            log_message("SIGNAL", f"⚠️ Redis write returned HTTP {res.status_code}: {res.text}")
+            return False
+    except Exception as err:
+        log_message("SIGNAL", f"❌ Failed to write kv_complete to Redis for client '{client_id}': {err}")
+        return False
 
 
 
@@ -540,8 +541,8 @@ def receive_state_update(req: StateUpdateItem, background_tasks: BackgroundTasks
             queue_global_rebuild(state_data, tokens_data)
             log_message("STATE_UPDATE", f"✅ Successfully queued global KV cache rebuild for client '{c_id}'!")
             
-        # Dispatch READY completion signal from 0bm runner back to Agent-0
-        background_tasks.add_task(send_ready_signal_to_agent0, c_id)
+        # Write kv_status=complete to Redis so wa-gateway drains the fallback queue
+        background_tasks.add_task(send_kv_complete_to_redis, c_id)
             
         print("═" * 65 + "\n", flush=True)
         return {"status": "success", "client_id": c_id, "state_size_bytes": len(raw_bytes)}
