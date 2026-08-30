@@ -418,7 +418,7 @@ def get_current_repo_name() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    pat: str = os.getenv("GITHUB_PAT", "")
+    pat: str = os.getenv("GITHUB_PAT", "") or os.getenv("GH_PAT", "")
     org: str = os.getenv("GITHUB_ORG", "LeadbaseAI-Official")
     repo_name: str = get_current_repo_name()
 
@@ -455,11 +455,15 @@ async def lifespan(app: FastAPI):
     public_url: Optional[str] = start_cloudflare_tunnel()
     if public_url:
         log_message("system", f"CLOUDFLARE TUNNEL ESTABLISHED SUCCESSFULLY! Address: {public_url}")
-        if pat:
-            update_github_dns(pat, org, public_url, repo_name)
+        update_github_dns(pat, org, public_url, repo_name)
     yield
 
 app = FastAPI(title="Local GGUF LLM API Server", lifespan=lifespan)
+
+@app.get("/health")
+@app.get("/")
+async def health_check() -> Dict[str, Any]:
+    return {"status": "ok", "accepting": is_accepting_requests}
 
 @app.post("/v1/chat")
 async def chat(req: ChatRequest) -> Dict[str, Any]:
